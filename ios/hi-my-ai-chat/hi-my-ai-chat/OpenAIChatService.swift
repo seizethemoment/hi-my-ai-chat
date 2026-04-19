@@ -242,9 +242,18 @@ struct OpenAIChatService: ChatServiceProtocol, Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(stream ? "text/event-stream" : "application/json", forHTTPHeaderField: "Accept")
 
+        let supplementalSystemPrompts = conversation
+            .filter { $0.role == .system }
+            .map(\.text)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.isEmpty == false }
+        let mergedSystemPrompt = ([systemPrompt] + supplementalSystemPrompts)
+            .joined(separator: "\n\n")
         let requestMessages =
-            [RequestMessage(role: .system, content: .text(systemPrompt))] +
-            conversation.map(makeRequestMessage)
+            [RequestMessage(role: .system, content: .text(mergedSystemPrompt))] +
+            conversation
+                .filter { $0.role != .system }
+                .map(makeRequestMessage)
 
         let body = RequestBody(
             model: model,

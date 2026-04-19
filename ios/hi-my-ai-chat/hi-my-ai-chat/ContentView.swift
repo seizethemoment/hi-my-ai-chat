@@ -52,6 +52,7 @@ struct ContentView: View {
     @State private var sidebarUnmountTask: Task<Void, Never>?
     @FocusState private var isTextFieldFocused: Bool
     private let makeChatService: (OpenAIModelConfiguration) throws -> any ChatServiceProtocol
+    private let conversationContextBuilder = ConversationContextBuilder()
 
     private let quickActions = [
         QuickAction(title: "写一首关于季节的古诗", systemImage: "leaf", prompt: "写一首关于季节的古诗"),
@@ -1150,14 +1151,9 @@ struct ContentView: View {
                 model: openAIModel
             )
             let service = try makeChatService(configuration)
+            let requestTurns = conversationContextBuilder.makeTurns(from: conversationSnapshot)
             let reply = try await service.streamReply(
-                for: conversationSnapshot.map { message in
-                    OpenAIChatTurn(
-                        role: message.role == .user ? .user : .assistant,
-                        text: message.text,
-                        imageDataURLs: message.attachments.map(\.dataURL)
-                    )
-                },
+                for: requestTurns,
                 timeoutInterval: 45,
                 maxRetryCount: 1,
                 onRetry: { retryAttempt in

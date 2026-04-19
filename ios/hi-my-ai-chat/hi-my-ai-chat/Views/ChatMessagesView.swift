@@ -15,36 +15,32 @@ struct ChatMessagesView: View {
         GeometryReader { proxy in
             ScrollViewReader { scrollProxy in
                 ScrollView(showsIndicators: false) {
-                    VStack(spacing: 0) {
-                        Spacer(minLength: 0)
-
-                        LazyVStack(spacing: 16) {
-                            if messages.isEmpty {
-                                Color.clear
-                                    .frame(height: 1)
-                                    .id("chat_empty_anchor")
-                            } else {
-                                ForEach(messages) { message in
-                                    MessageBubbleRow(
-                                        message: message,
-                                        canDelete: canDeleteMessages,
-                                        playingMessageID: playingMessageID,
-                                        onDelete: onDeleteMessage,
-                                        onAssistantCopyTap: onAssistantCopyTap,
-                                        onAssistantAudioTap: onAssistantAudioTap,
-                                        onAssistantFavoriteTap: onAssistantFavoriteTap
-                                    )
-                                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                                }
-
-                                Color.clear
-                                    .frame(height: 1)
-                                    .id("chat_bottom_anchor")
+                    LazyVStack(spacing: 16) {
+                        if messages.isEmpty {
+                            Color.clear
+                                .frame(height: 1)
+                                .id("chat_empty_anchor")
+                        } else {
+                            ForEach(messages) { message in
+                                MessageBubbleRow(
+                                    message: message,
+                                    canDelete: canDeleteMessages,
+                                    playingMessageID: playingMessageID,
+                                    onDelete: onDeleteMessage,
+                                    onAssistantCopyTap: onAssistantCopyTap,
+                                    onAssistantAudioTap: onAssistantAudioTap,
+                                    onAssistantFavoriteTap: onAssistantFavoriteTap
+                                )
+                                .transition(.move(edge: .bottom).combined(with: .opacity))
                             }
+
+                            Color.clear
+                                .frame(height: 1)
+                                .id("chat_bottom_anchor")
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .top)
-                    .frame(minHeight: max(proxy.size.height - 24, 0), alignment: .bottom)
+                    .frame(minHeight: max(proxy.size.height - 24, 0), alignment: .top)
                     .padding(.top, 12)
                     .padding(.bottom, 12)
                 }
