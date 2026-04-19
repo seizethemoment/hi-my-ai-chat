@@ -44,7 +44,7 @@ enum OpenAIChatServiceError: LocalizedError, Sendable {
     }
 }
 
-struct OpenAIChatService: Sendable {
+struct OpenAIChatService: ChatServiceProtocol, Sendable {
     private struct RequestBody: Encodable, Sendable {
         let model: String
         let messages: [RequestMessage]
