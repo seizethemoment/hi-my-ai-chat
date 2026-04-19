@@ -126,6 +126,7 @@ private struct AttachmentAction: Identifiable {
 struct ContentView: View {
     @StateObject private var sessionStore = ChatSessionStore()
     @StateObject private var voiceInputController = VoiceInputController()
+    @StateObject private var voicePlaybackController = VoicePlaybackController()
     @AppStorage("voice_auto_send_enabled") private var isVoiceAutoSendEnabled = true
     @AppStorage(OpenAISettings.apiKeyStorageKey) private var openAIAPIKey = ""
     @AppStorage(OpenAISettings.baseURLStorageKey) private var openAIBaseURL = ""
@@ -239,6 +240,10 @@ struct ContentView: View {
 
     private var currentSessionTitle: String {
         currentSession?.title ?? ChatSession.defaultTitle
+    }
+
+    private var latestPlayableAssistantMessage: ChatMessage? {
+        messages.last(where: isPlayableAssistantMessage(_:))
     }
 
     private var composerLoadingText: String {
@@ -375,7 +380,10 @@ struct ContentView: View {
                     title: currentSessionTitle,
                     subtitle: topSubtitleText,
                     onMenuTap: toggleSidebar,
-                    onTitleTap: promptRenameCurrentSession
+                    onTitleTap: promptRenameCurrentSession,
+                    isAudioAvailable: latestPlayableAssistantMessage != nil,
+                    isAudioPlaying: latestPlayableAssistantMessage?.id == voicePlaybackController.playingMessageID,
+                    onAudioTap: playLatestAssistantReply
                 )
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
@@ -385,7 +393,9 @@ struct ContentView: View {
                     messages: messages,
                     scrollToBottomRequest: scrollToBottomRequest,
                     canDeleteMessages: isRequestingReply == false,
-                    onDeleteMessage: deleteMessage
+                    playingMessageID: voicePlaybackController.playingMessageID,
+                    onDeleteMessage: deleteMessage,
+                    onAssistantAudioTap: toggleAssistantMessageAudio
                 ) {
                     dismissTransientUI()
                 }
@@ -656,6 +666,10 @@ struct ContentView: View {
         var updatedMessages = messages(for: currentSessionID)
         guard let index = updatedMessages.firstIndex(where: { $0.id == message.id }) else { return }
 
+        if voicePlaybackController.playingMessageID == message.id {
+            voicePlaybackController.stop()
+        }
+
         updatedMessages.remove(at: index)
         messages = updatedMessages
         liveMessagesBySession.removeValue(forKey: currentSessionID)
@@ -664,6 +678,7 @@ struct ContentView: View {
 
     private func loadSession(_ session: ChatSession) {
         voiceInputController.cancelCapture()
+        voicePlaybackController.stop()
         voiceToastDismissTask?.cancel()
         sidebarUnmountTask?.cancel()
         let sessionMessages = messages(for: session.id, fallback: session.messages)
@@ -993,6 +1008,7 @@ struct ContentView: View {
         isVoiceCancellationPending = false
         isAttachmentDrawerPresented = false
         dismissKeyboard()
+        voicePlaybackController.stop()
         voiceInputController.beginCapture()
     }
 
@@ -1078,6 +1094,7 @@ struct ContentView: View {
         pendingImageAttachments = []
         isAttachmentDrawerPresented = false
         voiceInputController.cancelCapture()
+        voicePlaybackController.stop()
         isTextFieldFocused = false
         prefersTextInput = false
         isRequestingReply = true
@@ -1268,6 +1285,24 @@ struct ContentView: View {
         return 18_000_000
     }
 
+    private func toggleAssistantMessageAudio(_ message: ChatMessage) {
+        guard isPlayableAssistantMessage(message) else { return }
+        voicePlaybackController.togglePlayback(for: message)
+    }
+
+    private func playLatestAssistantReply() {
+        guard let latestPlayableAssistantMessage else { return }
+        voicePlaybackController.togglePlayback(for: latestPlayableAssistantMessage)
+    }
+
+    private func isPlayableAssistantMessage(_ message: ChatMessage) -> Bool {
+        guard message.role == .assistant, message.state == .complete else {
+            return false
+        }
+
+        return message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
     private func dismissKeyboard() {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
@@ -1312,6 +1347,9 @@ private struct TopBarView: View {
     let subtitle: String
     let onMenuTap: () -> Void
     let onTitleTap: () -> Void
+    let isAudioAvailable: Bool
+    let isAudioPlaying: Bool
+    let onAudioTap: () -> Void
 
     var body: some View {
         ZStack {
@@ -1330,15 +1368,20 @@ private struct TopBarView: View {
                 Spacer()
 
                 HStack(spacing: 14) {
-                    Button(action: {}) {
-                        Image(systemName: "speaker.wave.2.fill")
+                    Button(action: onAudioTap) {
+                        Image(systemName: isAudioPlaying ? "stop.fill" : "speaker.wave.2.fill")
                             .font(.system(size: 18, weight: .semibold))
-                            .foregroundStyle(Color(red: 0.05, green: 0.45, blue: 1.0))
+                            .foregroundStyle(
+                                isAudioAvailable
+                                    ? Color(red: 0.05, green: 0.45, blue: 1.0)
+                                    : Color.black.opacity(0.18)
+                            )
                             .frame(width: 44, height: 44)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("语音播报")
+                    .disabled(isAudioAvailable == false)
+                    .accessibilityLabel(isAudioPlaying ? "停止朗读当前回复" : "朗读当前回复")
                     .accessibilityIdentifier("top_audio_button")
                 }
             }
@@ -2013,7 +2056,9 @@ private struct ChatMessagesView: View {
     let messages: [ChatMessage]
     let scrollToBottomRequest: Int
     let canDeleteMessages: Bool
+    let playingMessageID: UUID?
     let onDeleteMessage: (ChatMessage) -> Void
+    let onAssistantAudioTap: (ChatMessage) -> Void
     let onBackgroundTap: () -> Void
 
     var body: some View {
@@ -2033,7 +2078,9 @@ private struct ChatMessagesView: View {
                                     MessageBubbleRow(
                                         message: message,
                                         canDelete: canDeleteMessages,
-                                        onDelete: onDeleteMessage
+                                        playingMessageID: playingMessageID,
+                                        onDelete: onDeleteMessage,
+                                        onAssistantAudioTap: onAssistantAudioTap
                                     )
                                         .transition(.move(edge: .bottom).combined(with: .opacity))
                                 }
@@ -2093,7 +2140,9 @@ private struct ChatMessagesView: View {
 private struct MessageBubbleRow: View {
     let message: ChatMessage
     let canDelete: Bool
+    let playingMessageID: UUID?
     let onDelete: (ChatMessage) -> Void
+    let onAssistantAudioTap: (ChatMessage) -> Void
 
     var body: some View {
         HStack {
@@ -2108,7 +2157,11 @@ private struct MessageBubbleRow: View {
                     if message.state == .streaming {
                         StreamingMessageStatusView()
                     } else if message.showsActions {
-                        AssistantMessageActionsView(messageText: message.text)
+                        AssistantMessageActionsView(
+                            messageText: message.text,
+                            isAudioPlaying: playingMessageID == message.id,
+                            onAudioTap: { onAssistantAudioTap(message) }
+                        )
                     }
                 }
 
@@ -2315,21 +2368,41 @@ private struct StreamingMessageStatusView: View {
 
 private struct AssistantMessageActionsView: View {
     let messageText: String
+    let isAudioPlaying: Bool
+    let onAudioTap: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
-            actionButton(systemImage: "doc.on.doc") {
+            actionButton(
+                systemImage: "doc.on.doc",
+                accessibilityLabel: "复制消息",
+                accessibilityIdentifier: "assistant_message_copy_button"
+            ) {
                 UIPasteboard.general.string = messageText
             }
 
-            actionButton(systemImage: "speaker.wave.2.fill") {}
+            actionButton(
+                systemImage: isAudioPlaying ? "stop.fill" : "speaker.wave.2.fill",
+                accessibilityLabel: isAudioPlaying ? "停止朗读消息" : "朗读消息",
+                accessibilityIdentifier: "assistant_message_audio_button",
+                action: onAudioTap
+            )
 
-            actionButton(systemImage: "bookmark") {}
+            actionButton(
+                systemImage: "bookmark",
+                accessibilityLabel: "收藏消息",
+                accessibilityIdentifier: "assistant_message_bookmark_button"
+            ) {}
         }
         .padding(.leading, 2)
     }
 
-    private func actionButton(systemImage: String, action: @escaping () -> Void) -> some View {
+    private func actionButton(
+        systemImage: String,
+        accessibilityLabel: String,
+        accessibilityIdentifier: String,
+        action: @escaping () -> Void
+    ) -> some View {
         Button(action: action) {
             Image(systemName: systemImage)
                 .font(.system(size: 13, weight: .semibold))
@@ -2341,6 +2414,8 @@ private struct AssistantMessageActionsView: View {
                 )
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityIdentifier(accessibilityIdentifier)
     }
 }
 
