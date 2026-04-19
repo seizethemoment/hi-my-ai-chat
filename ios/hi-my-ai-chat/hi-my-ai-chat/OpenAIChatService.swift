@@ -8,7 +8,8 @@ enum OpenAIChatRole: String, Codable, Sendable {
 
 struct OpenAIChatTurn: Sendable {
     let role: OpenAIChatRole
-    let content: String
+    let text: String
+    let imageDataURLs: [String]
 }
 
 enum OpenAIChatServiceError: LocalizedError, Sendable {
@@ -46,19 +47,68 @@ enum OpenAIChatServiceError: LocalizedError, Sendable {
 struct OpenAIChatService: Sendable {
     private struct RequestBody: Encodable, Sendable {
         let model: String
-        let messages: [Message]
+        let messages: [RequestMessage]
         let temperature: Double
         let stream: Bool
     }
 
-    private struct Message: Codable, Sendable {
+    private struct RequestMessage: Encodable, Sendable {
+        enum Content: Encodable, Sendable {
+            case text(String)
+            case parts([ContentPart])
+
+            func encode(to encoder: Encoder) throws {
+                var singleValueContainer = encoder.singleValueContainer()
+
+                switch self {
+                case .text(let text):
+                    try singleValueContainer.encode(text)
+                case .parts(let parts):
+                    try singleValueContainer.encode(parts)
+                }
+            }
+        }
+
+        struct ContentPart: Encodable, Sendable {
+            struct ImageURLPayload: Encodable, Sendable {
+                let url: String
+                let detail: String
+            }
+
+            let type: String
+            let text: String?
+            let imageURL: ImageURLPayload?
+
+            private enum CodingKeys: String, CodingKey {
+                case type
+                case text
+                case imageURL = "image_url"
+            }
+
+            static func text(_ value: String) -> ContentPart {
+                ContentPart(type: "text", text: value, imageURL: nil)
+            }
+
+            static func image(url: String) -> ContentPart {
+                ContentPart(
+                    type: "image_url",
+                    text: nil,
+                    imageURL: ImageURLPayload(url: url, detail: "auto")
+                )
+            }
+        }
+
         let role: OpenAIChatRole
+        let content: Content
+    }
+
+    private struct ResponseMessage: Decodable, Sendable {
         let content: String
     }
 
     private struct ResponseBody: Decodable, Sendable {
         struct Choice: Decodable, Sendable {
-            let message: Message
+            let message: ResponseMessage
         }
 
         let choices: [Choice]
@@ -193,8 +243,8 @@ struct OpenAIChatService: Sendable {
         request.setValue(stream ? "text/event-stream" : "application/json", forHTTPHeaderField: "Accept")
 
         let requestMessages =
-            [Message(role: .system, content: systemPrompt)] +
-            conversation.map { Message(role: $0.role, content: $0.content) }
+            [RequestMessage(role: .system, content: .text(systemPrompt))] +
+            conversation.map(makeRequestMessage)
 
         let body = RequestBody(
             model: model,
@@ -204,6 +254,24 @@ struct OpenAIChatService: Sendable {
         )
         request.httpBody = try JSONEncoder().encode(body)
         return request
+    }
+
+    private func makeRequestMessage(for turn: OpenAIChatTurn) -> RequestMessage {
+        guard turn.imageDataURLs.isEmpty == false else {
+            return RequestMessage(role: turn.role, content: .text(turn.text))
+        }
+
+        let textParts = turn.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? []
+            : [RequestMessage.ContentPart.text(turn.text)]
+        let imageParts = turn.imageDataURLs.map { url in
+            RequestMessage.ContentPart.image(url: url)
+        }
+
+        return RequestMessage(
+            role: turn.role,
+            content: .parts(textParts + imageParts)
+        )
     }
 
     private func consumeStream(

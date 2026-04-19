@@ -15,12 +15,15 @@ struct ChatSession: Identifiable, Equatable {
     }
 
     var previewText: String {
-        if let latestText = messages
-            .reversed()
-            .first(where: { $0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false })?
-            .text
-            .trimmingCharacters(in: .whitespacesAndNewlines) {
-            return latestText
+        for message in messages.reversed() {
+            let trimmedText = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmedText.isEmpty == false {
+                return trimmedText
+            }
+
+            if message.attachments.isEmpty == false {
+                return message.attachments.count == 1 ? "[图片]" : "[\(message.attachments.count) 张图片]"
+            }
         }
 
         return "还没有消息"
@@ -44,7 +47,7 @@ struct ChatSession: Identifiable, Equatable {
 
         let trimmedText = firstUserMessage.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmedText.isEmpty == false else {
-            return defaultTitle
+            return firstUserMessage.attachments.isEmpty ? defaultTitle : "图片提问"
         }
 
         let compactText = trimmedText.replacingOccurrences(
@@ -281,19 +284,21 @@ private struct PersistedChatMessage: Codable {
     let id: UUID
     let role: String
     let text: String
+    let attachments: [PersistedChatImageAttachment]
     let showsActions: Bool
     let state: String
 
     @MainActor
     init?(message: ChatMessage) {
         let trimmedText = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if message.state == .streaming && trimmedText.isEmpty {
+        if message.state == .streaming && trimmedText.isEmpty && message.attachments.isEmpty {
             return nil
         }
 
         self.id = message.id
         self.role = message.role == .user ? "user" : "assistant"
         self.text = message.text
+        self.attachments = message.attachments.map(PersistedChatImageAttachment.init)
         self.showsActions = message.role == .assistant && trimmedText.isEmpty == false
         self.state = message.state == .failed ? "failed" : "complete"
     }
@@ -303,8 +308,25 @@ private struct PersistedChatMessage: Codable {
             id: id,
             role: role == "user" ? .user : .assistant,
             text: text,
+            attachments: attachments.map(\.attachment),
             showsActions: showsActions,
             state: state == "failed" ? .failed : .complete
         )
+    }
+}
+
+private struct PersistedChatImageAttachment: Codable {
+    let id: UUID
+    let data: Data
+    let mimeType: String
+
+    init(attachment: ChatImageAttachment) {
+        self.id = attachment.id
+        self.data = attachment.data
+        self.mimeType = attachment.mimeType
+    }
+
+    var attachment: ChatImageAttachment {
+        ChatImageAttachment(id: id, data: data, mimeType: mimeType)
     }
 }

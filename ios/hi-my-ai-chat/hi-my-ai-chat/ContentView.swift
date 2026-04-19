@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import PhotosUI
 import UIKit
 
 private enum SidebarItem: String, CaseIterable, Identifiable {
@@ -48,6 +49,7 @@ struct ChatMessage: Identifiable, Equatable {
     let id: UUID
     let role: Role
     var text: String
+    var attachments: [ChatImageAttachment]
     var showsActions: Bool
     var state: State
 
@@ -55,14 +57,49 @@ struct ChatMessage: Identifiable, Equatable {
         id: UUID = UUID(),
         role: Role,
         text: String,
+        attachments: [ChatImageAttachment] = [],
         showsActions: Bool,
         state: State = .complete
     ) {
         self.id = id
         self.role = role
         self.text = text
+        self.attachments = attachments
         self.showsActions = showsActions
         self.state = state
+    }
+}
+
+struct ChatImageAttachment: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let data: Data
+    let mimeType: String
+
+    init(
+        id: UUID = UUID(),
+        data: Data,
+        mimeType: String = "image/jpeg"
+    ) {
+        self.id = id
+        self.data = data
+        self.mimeType = mimeType
+    }
+
+    var dataURL: String {
+        "data:\(mimeType);base64,\(data.base64EncodedString())"
+    }
+
+    var image: UIImage? {
+        UIImage(data: data)
+    }
+
+    static func make(from image: UIImage, maxDimension: CGFloat = 1_600) -> ChatImageAttachment? {
+        let normalizedImage = image.normalizedForAttachment(maxDimension: maxDimension)
+        guard let data = normalizedImage.jpegData(compressionQuality: 0.82) else {
+            return nil
+        }
+
+        return ChatImageAttachment(data: data)
     }
 }
 
@@ -74,10 +111,16 @@ private struct QuickAction: Identifiable {
 }
 
 private struct AttachmentAction: Identifiable {
+    enum Source {
+        case camera
+        case photoLibrary
+    }
+
     let id = UUID()
     let title: String
     let systemImage: String
     let accessibilityIdentifier: String
+    let source: Source
 }
 
 struct ContentView: View {
@@ -98,14 +141,19 @@ struct ContentView: View {
     @State private var recentSearchTerms = SidebarSearchHistoryStore.load()
     @State private var inputText = ""
     @State private var messages: [ChatMessage] = []
+    @State private var pendingImageAttachments: [ChatImageAttachment] = []
+    @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var isRenameSessionAlertPresented = false
     @State private var renameSessionDraft = ""
     @State private var isRequestingReply = false
     @State private var currentRetryAttempt = 0
     @State private var isAttachmentDrawerPresented = false
+    @State private var isPhotoPickerPresented = false
+    @State private var isCameraPresented = false
     @State private var isVoiceCancellationPending = false
     @State private var voiceInputAlertMessage: String?
     @State private var voiceToastMessage: String?
+    @State private var mediaAlertMessage: String?
     @State private var prefersTextInput = false
     @State private var replyTasks: [UUID: Task<Void, Never>] = [:]
     @State private var liveMessagesBySession: [UUID: [ChatMessage]] = [:]
@@ -123,22 +171,46 @@ struct ContentView: View {
         QuickAction(title: "随便说点什么", systemImage: "ellipsis.bubble", prompt: "随便说点什么")
     ]
 
+    private let imageQuickActions = [
+        QuickAction(title: "这是什么", systemImage: "questionmark.circle", prompt: "这是什么？"),
+        QuickAction(title: "图片配文", systemImage: "text.quote", prompt: "帮我为这张图片写一段配文。"),
+        QuickAction(title: "提取图中文字", systemImage: "text.viewfinder", prompt: "请提取这张图片里的所有文字。"),
+        QuickAction(title: "翻译图中文字", systemImage: "globe", prompt: "请识别并翻译这张图片里的文字。")
+    ]
+
     private let attachmentActions = [
-        AttachmentAction(title: "相机", systemImage: "camera.fill", accessibilityIdentifier: "attachment_camera_button"),
-        AttachmentAction(title: "相册", systemImage: "photo.fill.on.rectangle.fill", accessibilityIdentifier: "attachment_photo_library_button"),
-        AttachmentAction(title: "文件", systemImage: "paperclip", accessibilityIdentifier: "attachment_file_button")
+        AttachmentAction(
+            title: "相机",
+            systemImage: "camera.fill",
+            accessibilityIdentifier: "attachment_camera_button",
+            source: .camera
+        ),
+        AttachmentAction(
+            title: "相册",
+            systemImage: "photo.fill.on.rectangle.fill",
+            accessibilityIdentifier: "attachment_photo_library_button",
+            source: .photoLibrary
+        )
     ]
 
     private var trimmedInput: String {
         inputText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private var hasPendingAttachments: Bool {
+        pendingImageAttachments.isEmpty == false
+    }
+
     private var canSend: Bool {
-        trimmedInput.isEmpty == false && isRequestingReply == false
+        (trimmedInput.isEmpty == false || hasPendingAttachments) && isRequestingReply == false
     }
 
     private var isTextMode: Bool {
-        prefersTextInput || inputText.isEmpty == false
+        prefersTextInput || inputText.isEmpty == false || hasPendingAttachments
+    }
+
+    private var activeQuickActions: [QuickAction] {
+        hasPendingAttachments ? imageQuickActions : quickActions
     }
 
     private var voiceSendMode: VoiceSendMode {
@@ -230,6 +302,26 @@ struct ContentView: View {
                 onDismiss: closeSettings
             )
         }
+        .fullScreenCover(isPresented: $isCameraPresented) {
+            CameraPickerView(
+                onImagePicked: appendCapturedImage,
+                onDismiss: dismissCamera
+            )
+        }
+        .photosPicker(
+            isPresented: $isPhotoPickerPresented,
+            selection: $selectedPhotoItems,
+            maxSelectionCount: 6,
+            matching: .images,
+            photoLibrary: .shared()
+        )
+        .task(id: selectedPhotoItems.count) {
+            let items = selectedPhotoItems
+            guard items.isEmpty == false else { return }
+
+            await appendSelectedPhotoItems(items)
+            selectedPhotoItems = []
+        }
     }
 
     @ViewBuilder
@@ -291,7 +383,9 @@ struct ContentView: View {
 
                 ChatMessagesView(
                     messages: messages,
-                    scrollToBottomRequest: scrollToBottomRequest
+                    scrollToBottomRequest: scrollToBottomRequest,
+                    canDeleteMessages: isRequestingReply == false,
+                    onDeleteMessage: deleteMessage
                 ) {
                     dismissTransientUI()
                 }
@@ -315,11 +409,15 @@ struct ContentView: View {
                         canSend: canSend,
                         isRequestingReply: isRequestingReply,
                         loadingText: composerLoadingText,
-                        quickActions: quickActions,
+                        quickActions: activeQuickActions,
                         attachmentActions: attachmentActions,
+                        pendingAttachments: pendingImageAttachments,
                         onQuickActionTap: applyQuickAction,
+                        onPrimaryAttachmentTap: presentCamera,
                         onModeButtonTap: handleModeButtonTap,
                         onAttachmentTap: toggleAttachmentDrawer,
+                        onAttachmentActionTap: handleAttachmentAction,
+                        onRemovePendingAttachment: removePendingAttachment,
                         onVoicePressBegan: beginVoiceCapture,
                         onVoiceCancelPreviewChanged: handleVoiceCancellationPendingChange,
                         onVoicePressEnded: endVoiceCapture,
@@ -386,6 +484,23 @@ struct ContentView: View {
             },
             message: {
                 Text(voiceInputAlertMessage ?? "")
+            }
+        )
+        .alert(
+            "图片不可用",
+            isPresented: Binding(
+                get: { mediaAlertMessage != nil },
+                set: { isPresented in
+                    if isPresented == false {
+                        mediaAlertMessage = nil
+                    }
+                }
+            ),
+            actions: {
+                Button("知道了", role: .cancel) {}
+            },
+            message: {
+                Text(mediaAlertMessage ?? "")
             }
         )
         .alert(
@@ -535,6 +650,18 @@ struct ContentView: View {
         recentSearchTerms = SidebarSearchHistoryStore.remove(term)
     }
 
+    private func deleteMessage(_ message: ChatMessage) {
+        guard let currentSessionID, isRequestingReply == false else { return }
+
+        var updatedMessages = messages(for: currentSessionID)
+        guard let index = updatedMessages.firstIndex(where: { $0.id == message.id }) else { return }
+
+        updatedMessages.remove(at: index)
+        messages = updatedMessages
+        liveMessagesBySession.removeValue(forKey: currentSessionID)
+        sessionStore.updateMessages(updatedMessages, for: currentSessionID)
+    }
+
     private func loadSession(_ session: ChatSession) {
         voiceInputController.cancelCapture()
         voiceToastDismissTask?.cancel()
@@ -543,11 +670,16 @@ struct ContentView: View {
         currentSessionID = session.id
         messages = sessionMessages
         inputText = ""
+        pendingImageAttachments = []
+        selectedPhotoItems = []
         isVoiceCancellationPending = false
         voiceToastMessage = nil
+        mediaAlertMessage = nil
         renameSessionDraft = ""
         isRenameSessionAlertPresented = false
         isAttachmentDrawerPresented = false
+        isPhotoPickerPresented = false
+        isCameraPresented = false
         isTextFieldFocused = false
         prefersTextInput = false
         syncReplyState(for: session.id)
@@ -747,9 +879,89 @@ struct ContentView: View {
         focusComposerTextField()
     }
 
+    private func handleAttachmentAction(_ action: AttachmentAction) {
+        switch action.source {
+        case .camera:
+            presentCamera()
+        case .photoLibrary:
+            presentPhotoLibrary()
+        }
+    }
+
+    private func presentPhotoLibrary() {
+        voiceInputController.cancelCapture()
+        isAttachmentDrawerPresented = false
+        isTextFieldFocused = false
+        dismissKeyboard()
+        isPhotoPickerPresented = true
+    }
+
+    private func presentCamera() {
+        guard UIImagePickerController.isSourceTypeAvailable(.camera) else {
+            mediaAlertMessage = "当前设备不支持拍照，请在真机上使用相机功能。"
+            return
+        }
+
+        voiceInputController.cancelCapture()
+        isAttachmentDrawerPresented = false
+        isTextFieldFocused = false
+        dismissKeyboard()
+        isCameraPresented = true
+    }
+
+    private func dismissCamera() {
+        isCameraPresented = false
+    }
+
+    private func appendCapturedImage(_ image: UIImage) {
+        appendLoadedImage(image)
+        dismissCamera()
+    }
+
+    private func appendSelectedPhotoItems(_ items: [PhotosPickerItem]) async {
+        for item in items {
+            guard Task.isCancelled == false else { return }
+
+            do {
+                guard let data = try await item.loadTransferable(type: Data.self),
+                      let image = UIImage(data: data) else {
+                    continue
+                }
+
+                await MainActor.run {
+                    appendLoadedImage(image)
+                }
+            } catch {
+                await MainActor.run {
+                    mediaAlertMessage = "读取图片失败，请换一张图片重试。"
+                }
+            }
+        }
+    }
+
+    private func appendLoadedImage(_ image: UIImage) {
+        guard let attachment = ChatImageAttachment.make(from: image) else {
+            mediaAlertMessage = "处理图片失败，请换一张图片重试。"
+            return
+        }
+
+        pendingImageAttachments.append(attachment)
+        prefersTextInput = true
+        isAttachmentDrawerPresented = false
+        focusComposerTextField()
+    }
+
+    private func removePendingAttachment(_ attachmentID: UUID) {
+        pendingImageAttachments.removeAll { $0.id == attachmentID }
+
+        if pendingImageAttachments.isEmpty, inputText.isEmpty {
+            prefersTextInput = false
+        }
+    }
+
     private func handleModeButtonTap() {
         if isTextMode {
-            if inputText.isEmpty {
+            if inputText.isEmpty, pendingImageAttachments.isEmpty {
                 prefersTextInput = false
                 dismissTransientUI()
             } else {
@@ -822,7 +1034,7 @@ struct ContentView: View {
         isVoiceCancellationPending = false
         isAttachmentDrawerPresented = false
         isTextFieldFocused = false
-        if inputText.isEmpty {
+        if inputText.isEmpty, pendingImageAttachments.isEmpty {
             prefersTextInput = false
         }
         dismissKeyboard()
@@ -839,7 +1051,13 @@ struct ContentView: View {
         guard canSend, let currentSessionID else { return }
 
         let prompt = trimmedInput
-        let newUserMessage = ChatMessage(role: .user, text: prompt, showsActions: false)
+        let attachments = pendingImageAttachments
+        let newUserMessage = ChatMessage(
+            role: .user,
+            text: prompt,
+            attachments: attachments,
+            showsActions: false
+        )
         let conversationSnapshot = messages + [newUserMessage]
         let assistantMessageID = UUID()
 
@@ -857,6 +1075,7 @@ struct ContentView: View {
         }
 
         inputText = ""
+        pendingImageAttachments = []
         isAttachmentDrawerPresented = false
         voiceInputController.cancelCapture()
         isTextFieldFocused = false
@@ -907,7 +1126,8 @@ struct ContentView: View {
                 for: conversationSnapshot.map { message in
                     OpenAIChatTurn(
                         role: message.role == .user ? .user : .assistant,
-                        content: message.text
+                        text: message.text,
+                        imageDataURLs: message.attachments.map(\.dataURL)
                     )
                 },
                 onRetry: { retryAttempt in
@@ -1792,6 +2012,8 @@ private struct SettingsAPIKeyField: View {
 private struct ChatMessagesView: View {
     let messages: [ChatMessage]
     let scrollToBottomRequest: Int
+    let canDeleteMessages: Bool
+    let onDeleteMessage: (ChatMessage) -> Void
     let onBackgroundTap: () -> Void
 
     var body: some View {
@@ -1808,7 +2030,11 @@ private struct ChatMessagesView: View {
                                     .id("chat_empty_anchor")
                             } else {
                                 ForEach(messages) { message in
-                                    MessageBubbleRow(message: message)
+                                    MessageBubbleRow(
+                                        message: message,
+                                        canDelete: canDeleteMessages,
+                                        onDelete: onDeleteMessage
+                                    )
                                         .transition(.move(edge: .bottom).combined(with: .opacity))
                                 }
 
@@ -1866,6 +2092,8 @@ private struct ChatMessagesView: View {
 
 private struct MessageBubbleRow: View {
     let message: ChatMessage
+    let canDelete: Bool
+    let onDelete: (ChatMessage) -> Void
 
     var body: some View {
         HStack {
@@ -1897,6 +2125,15 @@ private struct MessageBubbleRow: View {
         }
         .frame(maxWidth: .infinity)
         .id(message.id)
+        .contextMenu {
+            if canDelete {
+                Button(role: .destructive) {
+                    onDelete(message)
+                } label: {
+                    Label("删除消息", systemImage: "trash")
+                }
+            }
+        }
     }
 
     private var assistantBackgroundColor: Color {
@@ -1917,15 +2154,24 @@ private struct MessageBubbleRow: View {
 
     private func bubble(background: Color, foreground: Color, alignment: Alignment) -> some View {
         Group {
-            if message.state == .streaming && message.text.isEmpty {
+            if message.state == .streaming, message.text.isEmpty, message.attachments.isEmpty {
                 TypingIndicatorView()
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                Text(message.text)
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(foreground)
-                    .multilineTextAlignment(.leading)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: message.text.isEmpty || message.attachments.isEmpty ? 0 : 10) {
+                    if message.attachments.isEmpty == false {
+                        MessageAttachmentGridView(attachments: message.attachments)
+                    }
+
+                    if message.text.isEmpty == false {
+                        Text(message.text)
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(foreground)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
             .padding(.horizontal, 16)
@@ -1936,6 +2182,98 @@ private struct MessageBubbleRow: View {
                     .fill(background)
             )
             .frame(maxWidth: .infinity, alignment: alignment)
+    }
+}
+
+private struct MessageAttachmentGridView: View {
+    let attachments: [ChatImageAttachment]
+
+    private var columns: [GridItem] {
+        Array(
+            repeating: GridItem(.flexible(), spacing: 6),
+            count: attachments.count == 1 ? 1 : 2
+        )
+    }
+
+    private var itemHeight: CGFloat {
+        attachments.count == 1 ? 188 : 108
+    }
+
+    var body: some View {
+        LazyVGrid(columns: columns, spacing: 6) {
+            ForEach(attachments) { attachment in
+                ChatAttachmentThumbnailView(
+                    attachment: attachment,
+                    height: itemHeight,
+                    cornerRadius: 12
+                )
+            }
+        }
+    }
+}
+
+private struct PendingAttachmentStripView: View {
+    let attachments: [ChatImageAttachment]
+    let onRemove: (UUID) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                ForEach(attachments) { attachment in
+                    ZStack(alignment: .topTrailing) {
+                        ChatAttachmentThumbnailView(
+                            attachment: attachment,
+                            width: 84,
+                            height: 84,
+                            cornerRadius: 16
+                        )
+
+                        Button {
+                            onRemove(attachment.id)
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundStyle(Color.white)
+                                .frame(width: 24, height: 24)
+                                .background(Circle().fill(Color.black.opacity(0.68)))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(6)
+                    }
+                }
+            }
+            .padding(.horizontal, 2)
+        }
+    }
+}
+
+private struct ChatAttachmentThumbnailView: View {
+    let attachment: ChatImageAttachment
+    var width: CGFloat? = nil
+    let height: CGFloat
+    let cornerRadius: CGFloat
+
+    var body: some View {
+        Group {
+            if let image = attachment.image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                ZStack {
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .fill(Color.black.opacity(0.06))
+
+                    Image(systemName: "photo")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(Color.black.opacity(0.28))
+                }
+            }
+        }
+        .frame(maxWidth: width == nil ? .infinity : width, alignment: .center)
+        .frame(width: width, height: height)
+        .clipped()
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
     }
 }
 
@@ -2016,9 +2354,13 @@ private struct ComposerDockView: View {
     let loadingText: String
     let quickActions: [QuickAction]
     let attachmentActions: [AttachmentAction]
+    let pendingAttachments: [ChatImageAttachment]
     let onQuickActionTap: (QuickAction) -> Void
+    let onPrimaryAttachmentTap: () -> Void
     let onModeButtonTap: () -> Void
     let onAttachmentTap: () -> Void
+    let onAttachmentActionTap: (AttachmentAction) -> Void
+    let onRemovePendingAttachment: (UUID) -> Void
     let onVoicePressBegan: () -> Void
     let onVoiceCancelPreviewChanged: (Bool) -> Void
     let onVoicePressEnded: (Bool) -> Void
@@ -2029,10 +2371,20 @@ private struct ComposerDockView: View {
             QuickActionsRow(actions: quickActions, onTap: onQuickActionTap)
                 .accessibilityIdentifier("quick_action_scroll")
 
+            if pendingAttachments.isEmpty == false {
+                PendingAttachmentStripView(
+                    attachments: pendingAttachments,
+                    onRemove: onRemovePendingAttachment
+                )
+            }
+
             composerCard
 
             if isAttachmentDrawerPresented {
-                AttachmentDrawerView(actions: attachmentActions)
+                AttachmentDrawerView(
+                    actions: attachmentActions,
+                    onTap: onAttachmentActionTap
+                )
                     .accessibilityIdentifier("attachment_drawer")
             }
         }
@@ -2044,7 +2396,7 @@ private struct ComposerDockView: View {
                 IconStripButton(
                     systemImage: "camera",
                     accessibilityIdentifier: "composer_camera_button",
-                    action: {}
+                    action: onPrimaryAttachmentTap
                 )
             }
 
@@ -2236,27 +2588,36 @@ private struct IconStripButton: View {
 private struct AttachmentDrawerView: View {
     let actions: [AttachmentAction]
 
-    private let columns = Array(repeating: GridItem(.flexible(), spacing: 10), count: 3)
+    private var columns: [GridItem] {
+        Array(repeating: GridItem(.flexible(), spacing: 10), count: max(actions.count, 1))
+    }
+
+    let onTap: (AttachmentAction) -> Void
 
     var body: some View {
         LazyVGrid(columns: columns, spacing: 10) {
             ForEach(actions) { action in
-                VStack(spacing: 10) {
-                    Image(systemName: action.systemImage)
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundStyle(Color.black.opacity(0.84))
-                        .frame(width: 34, height: 34)
+                Button {
+                    onTap(action)
+                } label: {
+                    VStack(spacing: 10) {
+                        Image(systemName: action.systemImage)
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundStyle(Color.black.opacity(0.84))
+                            .frame(width: 34, height: 34)
 
-                    Text(action.title)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(Color.black.opacity(0.72))
+                        Text(action.title)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(Color.black.opacity(0.72))
+                    }
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 76)
+                    .background(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(Color(red: 0.965, green: 0.965, blue: 0.968))
+                    )
                 }
-                .frame(maxWidth: .infinity)
-                .frame(height: 76)
-                .background(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(Color(red: 0.965, green: 0.965, blue: 0.968))
-                )
+                .buttonStyle(.plain)
                 .accessibilityIdentifier(action.accessibilityIdentifier)
             }
         }
@@ -2425,6 +2786,73 @@ private struct RecordingOverlayView: View {
         }
 
         return state == .recognizing ? "text.bubble.fill" : "waveform"
+    }
+}
+
+private struct CameraPickerView: UIViewControllerRepresentable {
+    let onImagePicked: (UIImage) -> Void
+    let onDismiss: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onImagePicked: onImagePicked, onDismiss: onDismiss)
+    }
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = .camera
+        picker.delegate = context.coordinator
+        picker.cameraCaptureMode = .photo
+        picker.allowsEditing = false
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIImagePickerController, context: Context) {}
+
+    final class Coordinator: NSObject, UINavigationControllerDelegate, UIImagePickerControllerDelegate {
+        private let onImagePicked: (UIImage) -> Void
+        private let onDismiss: () -> Void
+
+        init(
+            onImagePicked: @escaping (UIImage) -> Void,
+            onDismiss: @escaping () -> Void
+        ) {
+            self.onImagePicked = onImagePicked
+            self.onDismiss = onDismiss
+        }
+
+        func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+            onDismiss()
+        }
+
+        func imagePickerController(
+            _ picker: UIImagePickerController,
+            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+        ) {
+            if let image = info[.originalImage] as? UIImage {
+                onImagePicked(image)
+            } else {
+                onDismiss()
+            }
+        }
+    }
+}
+
+private extension UIImage {
+    func normalizedForAttachment(maxDimension: CGFloat) -> UIImage {
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 1
+
+        let size = self.size
+        let longestEdge = max(size.width, size.height)
+        let scaleRatio = longestEdge > maxDimension ? maxDimension / longestEdge : 1
+        let targetSize = CGSize(
+            width: max(size.width * scaleRatio, 1),
+            height: max(size.height * scaleRatio, 1)
+        )
+
+        return UIGraphicsImageRenderer(size: targetSize, format: format).image { _ in
+            draw(in: CGRect(origin: .zero, size: targetSize))
+        }
     }
 }
 
