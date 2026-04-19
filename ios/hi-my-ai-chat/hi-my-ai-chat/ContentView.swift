@@ -52,6 +52,11 @@ struct ChatMessage: Identifiable, Equatable {
     var attachments: [ChatImageAttachment]
     var showsActions: Bool
     var state: State
+    var favoritedAt: Date?
+
+    var isFavorite: Bool {
+        favoritedAt != nil
+    }
 
     init(
         id: UUID = UUID(),
@@ -59,7 +64,8 @@ struct ChatMessage: Identifiable, Equatable {
         text: String,
         attachments: [ChatImageAttachment] = [],
         showsActions: Bool,
-        state: State = .complete
+        state: State = .complete,
+        favoritedAt: Date? = nil
     ) {
         self.id = id
         self.role = role
@@ -67,6 +73,7 @@ struct ChatMessage: Identifiable, Equatable {
         self.attachments = attachments
         self.showsActions = showsActions
         self.state = state
+        self.favoritedAt = favoritedAt
     }
 }
 
@@ -123,6 +130,20 @@ private struct AttachmentAction: Identifiable {
     let source: Source
 }
 
+private struct FavoritedMessageEntry: Identifiable {
+    let sessionID: UUID
+    let sessionTitle: String
+    let message: ChatMessage
+
+    var id: UUID {
+        message.id
+    }
+
+    var favoritedAt: Date {
+        message.favoritedAt ?? .distantPast
+    }
+}
+
 struct ContentView: View {
     @StateObject private var sessionStore = ChatSessionStore()
     @StateObject private var voiceInputController = VoiceInputController()
@@ -153,7 +174,7 @@ struct ContentView: View {
     @State private var isCameraPresented = false
     @State private var isVoiceCancellationPending = false
     @State private var voiceInputAlertMessage: String?
-    @State private var voiceToastMessage: String?
+    @State private var toastMessage: String?
     @State private var mediaAlertMessage: String?
     @State private var prefersTextInput = false
     @State private var replyTasks: [UUID: Task<Void, Never>] = [:]
@@ -162,7 +183,7 @@ struct ContentView: View {
     @State private var activeAssistantMessageIDsBySession: [UUID: UUID] = [:]
     @State private var activeAssistantMessageID: UUID?
     @State private var scrollToBottomRequest = 0
-    @State private var voiceToastDismissTask: Task<Void, Never>?
+    @State private var toastDismissTask: Task<Void, Never>?
     @State private var sidebarUnmountTask: Task<Void, Never>?
     @FocusState private var isTextFieldFocused: Bool
 
@@ -242,8 +263,43 @@ struct ContentView: View {
         currentSession?.title ?? ChatSession.defaultTitle
     }
 
+    private var activeSidebarItem: SidebarItem {
+        selectedSidebarItem ?? .chat
+    }
+
     private var latestPlayableAssistantMessage: ChatMessage? {
         messages.last(where: isPlayableAssistantMessage(_:))
+    }
+
+    private var favoriteEntries: [FavoritedMessageEntry] {
+        sessionStore.sessions
+            .flatMap { session in
+                let sessionMessages = messages(for: session.id, fallback: session.messages)
+                return sessionMessages.compactMap { message -> FavoritedMessageEntry? in
+                    guard message.role == .assistant,
+                          message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
+                          message.favoritedAt != nil else {
+                        return nil
+                    }
+
+                    return FavoritedMessageEntry(
+                        sessionID: session.id,
+                        sessionTitle: session.title,
+                        message: message
+                    )
+                }
+            }
+            .sorted { lhs, rhs in
+                if lhs.favoritedAt == rhs.favoritedAt {
+                    return lhs.sessionTitle.localizedStandardCompare(rhs.sessionTitle) == .orderedAscending
+                }
+
+                return lhs.favoritedAt > rhs.favoritedAt
+            }
+    }
+
+    private var favoritesSubtitleText: String {
+        favoriteEntries.isEmpty ? "还没有收藏的回复" : "已收藏 \(favoriteEntries.count) 条回复"
     }
 
     private var composerLoadingText: String {
@@ -260,7 +316,7 @@ struct ContentView: View {
             let showsSidebarDrawer = isSidebarDrawerMounted || isSidebarPresented || sidebarDragOffset != 0
 
             ZStack(alignment: .leading) {
-                chatDetailView
+                detailView
                     .offset(x: revealedWidth)
                     .simultaneousGesture(sidebarOpenGesture(drawerWidth: drawerWidth), including: .all)
                     .zIndex(isSidebarPresented ? 1 : 3)
@@ -330,6 +386,16 @@ struct ContentView: View {
     }
 
     @ViewBuilder
+    private var detailView: some View {
+        switch activeSidebarItem {
+        case .chat:
+            chatDetailView
+        case .favorites:
+            favoritesDetailView
+        }
+    }
+
+    @ViewBuilder
     private func sidebarDrawer(
         drawerWidth: CGFloat,
         drawerOffset: CGFloat,
@@ -381,6 +447,7 @@ struct ContentView: View {
                     subtitle: topSubtitleText,
                     onMenuTap: toggleSidebar,
                     onTitleTap: promptRenameCurrentSession,
+                    isTitleEnabled: true,
                     isAudioAvailable: latestPlayableAssistantMessage != nil,
                     isAudioPlaying: latestPlayableAssistantMessage?.id == voicePlaybackController.playingMessageID,
                     onAudioTap: playLatestAssistantReply
@@ -395,7 +462,9 @@ struct ContentView: View {
                     canDeleteMessages: isRequestingReply == false,
                     playingMessageID: voicePlaybackController.playingMessageID,
                     onDeleteMessage: deleteMessage,
-                    onAssistantAudioTap: toggleAssistantMessageAudio
+                    onAssistantCopyTap: handleAssistantMessageCopy,
+                    onAssistantAudioTap: toggleAssistantMessageAudio,
+                    onAssistantFavoriteTap: toggleAssistantMessageFavorite
                 ) {
                     dismissTransientUI()
                 }
@@ -405,8 +474,8 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 VStack(alignment: .leading, spacing: 10) {
-                    if let voiceToastMessage {
-                        InlineToastView(message: voiceToastMessage)
+                    if let toastMessage {
+                        InlineToastView(message: toastMessage)
                             .padding(.horizontal, 18)
                             .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
@@ -437,7 +506,7 @@ struct ContentView: View {
                     .padding(.top, 8)
                     .padding(.bottom, 16)
                 }
-                .animation(.easeInOut(duration: 0.18), value: voiceToastMessage)
+                .animation(.easeInOut(duration: 0.18), value: toastMessage)
             }
 
             if isVoiceOverlayVisible {
@@ -476,7 +545,7 @@ struct ContentView: View {
         }
         .onChange(of: voiceInputController.toastMessage) { _, message in
             guard let message else { return }
-            presentVoiceToast(message)
+            presentToast(message)
             voiceInputController.consumeToastMessage()
         }
         .alert(
@@ -533,6 +602,49 @@ struct ContentView: View {
         )
     }
 
+    private var favoritesDetailView: some View {
+        ZStack(alignment: .bottom) {
+            HomeBackgroundView()
+
+            VStack(spacing: 0) {
+                TopBarView(
+                    title: SidebarItem.favorites.title,
+                    subtitle: favoritesSubtitleText,
+                    onMenuTap: toggleSidebar,
+                    onTitleTap: {},
+                    isTitleEnabled: false,
+                    isAudioAvailable: false,
+                    isAudioPlaying: false,
+                    onAudioTap: {}
+                )
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 8)
+
+                FavoritesView(
+                    entries: favoriteEntries,
+                    onOpenEntry: openFavoritedMessage,
+                    onRemoveFavorite: removeFavorite
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.horizontal, 12)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let toastMessage {
+                        InlineToastView(message: toastMessage)
+                            .padding(.horizontal, 18)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                }
+                .padding(.bottom, 16)
+                .animation(.easeInOut(duration: 0.18), value: toastMessage)
+            }
+        }
+        .background(Color(red: 0.985, green: 0.985, blue: 0.982))
+    }
+
     private func toggleSidebar() {
         isSidebarPresented ? closeSidebar() : openSidebar()
     }
@@ -579,7 +691,6 @@ struct ContentView: View {
 
     private func closeSettings() {
         isSettingsPresented = false
-        selectedSidebarItem = .chat
     }
 
     private func toggleSidebarEditing() {
@@ -636,6 +747,7 @@ struct ContentView: View {
 
     private func handleSearchSessionSelection(_ session: ChatSession, query: String) {
         recentSearchTerms = SidebarSearchHistoryStore.record(query)
+        selectedSidebarItem = .chat
         if let selectedSession = sessionStore.selectSession(id: session.id) {
             loadSession(selectedSession)
         }
@@ -679,7 +791,7 @@ struct ContentView: View {
     private func loadSession(_ session: ChatSession) {
         voiceInputController.cancelCapture()
         voicePlaybackController.stop()
-        voiceToastDismissTask?.cancel()
+        toastDismissTask?.cancel()
         sidebarUnmountTask?.cancel()
         let sessionMessages = messages(for: session.id, fallback: session.messages)
         currentSessionID = session.id
@@ -688,7 +800,7 @@ struct ContentView: View {
         pendingImageAttachments = []
         selectedPhotoItems = []
         isVoiceCancellationPending = false
-        voiceToastMessage = nil
+        toastMessage = nil
         mediaAlertMessage = nil
         renameSessionDraft = ""
         isRenameSessionAlertPresented = false
@@ -734,18 +846,18 @@ struct ContentView: View {
         renameSessionDraft = ""
     }
 
-    private func presentVoiceToast(_ message: String) {
-        voiceToastDismissTask?.cancel()
+    private func presentToast(_ message: String) {
+        toastDismissTask?.cancel()
 
         withAnimation(.easeInOut(duration: 0.18)) {
-            voiceToastMessage = message
+            toastMessage = message
         }
 
-        voiceToastDismissTask = Task {
+        toastDismissTask = Task {
             try? await Task.sleep(nanoseconds: 1_400_000_000)
             await MainActor.run {
                 withAnimation(.easeInOut(duration: 0.18)) {
-                    voiceToastMessage = nil
+                    toastMessage = nil
                 }
             }
         }
@@ -777,6 +889,19 @@ struct ContentView: View {
         if currentSessionID == sessionID {
             messages = updatedMessages
         }
+    }
+
+    private func persistMessages(
+        _ updatedMessages: [ChatMessage],
+        for sessionID: UUID,
+        shouldRefreshTimestamp: Bool
+    ) {
+        updateMessages(updatedMessages, for: sessionID)
+        sessionStore.updateMessages(
+            updatedMessages,
+            for: sessionID,
+            shouldRefreshTimestamp: shouldRefreshTimestamp
+        )
     }
 
     private func finishLiveMessages(_ finalMessages: [ChatMessage], for sessionID: UUID) {
@@ -1290,6 +1415,16 @@ struct ContentView: View {
         voicePlaybackController.togglePlayback(for: message)
     }
 
+    private func handleAssistantMessageCopy(_ message: ChatMessage) {
+        UIPasteboard.general.string = message.text
+        presentToast("已复制到剪贴板")
+    }
+
+    private func toggleAssistantMessageFavorite(_ message: ChatMessage) {
+        guard let currentSessionID, message.role == .assistant else { return }
+        setFavoriteState(isFavorite: message.isFavorite == false, for: message.id, in: currentSessionID)
+    }
+
     private func playLatestAssistantReply() {
         guard let latestPlayableAssistantMessage else { return }
         voicePlaybackController.togglePlayback(for: latestPlayableAssistantMessage)
@@ -1301,6 +1436,28 @@ struct ContentView: View {
         }
 
         return message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    private func setFavoriteState(isFavorite: Bool, for messageID: UUID, in sessionID: UUID) {
+        var sessionMessages = messages(for: sessionID)
+        guard let index = sessionMessages.firstIndex(where: { $0.id == messageID }) else { return }
+
+        sessionMessages[index].favoritedAt = isFavorite ? Date() : nil
+        persistMessages(sessionMessages, for: sessionID, shouldRefreshTimestamp: false)
+
+        presentToast(isFavorite ? "已收藏" : "已取消收藏")
+    }
+
+    private func openFavoritedMessage(_ entry: FavoritedMessageEntry) {
+        selectedSidebarItem = .chat
+
+        if let selectedSession = sessionStore.selectSession(id: entry.sessionID) {
+            loadSession(selectedSession)
+        }
+    }
+
+    private func removeFavorite(_ entry: FavoritedMessageEntry) {
+        setFavoriteState(isFavorite: false, for: entry.message.id, in: entry.sessionID)
     }
 
     private func dismissKeyboard() {
@@ -1347,6 +1504,7 @@ private struct TopBarView: View {
     let subtitle: String
     let onMenuTap: () -> Void
     let onTitleTap: () -> Void
+    let isTitleEnabled: Bool
     let isAudioAvailable: Bool
     let isAudioPlaying: Bool
     let onAudioTap: () -> Void
@@ -1403,6 +1561,7 @@ private struct TopBarView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .disabled(isTitleEnabled == false)
             .accessibilityIdentifier("top_title_button")
         }
         .frame(maxWidth: .infinity)
@@ -2052,13 +2211,135 @@ private struct SettingsAPIKeyField: View {
     }
 }
 
+private struct FavoritesView: View {
+    let entries: [FavoritedMessageEntry]
+    let onOpenEntry: (FavoritedMessageEntry) -> Void
+    let onRemoveFavorite: (FavoritedMessageEntry) -> Void
+
+    var body: some View {
+        ScrollView(showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 14) {
+                if entries.isEmpty {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Image(systemName: "bookmark.slash")
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundStyle(Color.black.opacity(0.30))
+
+                        Text("还没有收藏的回复")
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundStyle(Color.black.opacity(0.78))
+
+                        Text("在聊天页面点击模型回复下方的收藏按钮，收藏的内容会显示在这里。")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(Color.black.opacity(0.42))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 20)
+                    .background(
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .fill(Color.white)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .stroke(Color.black.opacity(0.05), lineWidth: 1)
+                    )
+                    .padding(.top, 16)
+                } else {
+                    ForEach(entries) { entry in
+                        FavoriteMessageCard(
+                            entry: entry,
+                            onOpen: { onOpenEntry(entry) },
+                            onRemoveFavorite: { onRemoveFavorite(entry) }
+                        )
+                    }
+                }
+            }
+            .padding(.top, 12)
+            .padding(.bottom, 24)
+        }
+    }
+}
+
+private struct FavoriteMessageCard: View {
+    let entry: FavoritedMessageEntry
+    let onOpen: () -> Void
+    let onRemoveFavorite: () -> Void
+
+    private var favoriteTimeText: String {
+        entry.favoritedAt.formatted(date: .abbreviated, time: .shortened)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(entry.sessionTitle)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(Color.black.opacity(0.76))
+                        .lineLimit(1)
+
+                    Text("收藏于 \(favoriteTimeText)")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Color.black.opacity(0.34))
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 12)
+
+                Button(action: onRemoveFavorite) {
+                    Image(systemName: "bookmark.slash")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color(red: 0.10, green: 0.54, blue: 1.0))
+                        .frame(width: 32, height: 32)
+                        .background(
+                            Circle()
+                                .fill(Color(red: 0.94, green: 0.97, blue: 1.0))
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("favorites_remove_button_\(entry.id.uuidString)")
+            }
+
+            Button(action: onOpen) {
+                Text(entry.message.text)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(Color.black.opacity(0.82))
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 14)
+                    .background(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(Color(red: 0.972, green: 0.976, blue: 0.982))
+                    )
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("favorites_open_entry_\(entry.id.uuidString)")
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 18)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color.white)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(Color.black.opacity(0.05), lineWidth: 1)
+        )
+    }
+}
+
 private struct ChatMessagesView: View {
     let messages: [ChatMessage]
     let scrollToBottomRequest: Int
     let canDeleteMessages: Bool
     let playingMessageID: UUID?
     let onDeleteMessage: (ChatMessage) -> Void
+    let onAssistantCopyTap: (ChatMessage) -> Void
     let onAssistantAudioTap: (ChatMessage) -> Void
+    let onAssistantFavoriteTap: (ChatMessage) -> Void
     let onBackgroundTap: () -> Void
 
     var body: some View {
@@ -2080,7 +2361,9 @@ private struct ChatMessagesView: View {
                                         canDelete: canDeleteMessages,
                                         playingMessageID: playingMessageID,
                                         onDelete: onDeleteMessage,
-                                        onAssistantAudioTap: onAssistantAudioTap
+                                        onAssistantCopyTap: onAssistantCopyTap,
+                                        onAssistantAudioTap: onAssistantAudioTap,
+                                        onAssistantFavoriteTap: onAssistantFavoriteTap
                                     )
                                         .transition(.move(edge: .bottom).combined(with: .opacity))
                                 }
@@ -2142,7 +2425,9 @@ private struct MessageBubbleRow: View {
     let canDelete: Bool
     let playingMessageID: UUID?
     let onDelete: (ChatMessage) -> Void
+    let onAssistantCopyTap: (ChatMessage) -> Void
     let onAssistantAudioTap: (ChatMessage) -> Void
+    let onAssistantFavoriteTap: (ChatMessage) -> Void
 
     var body: some View {
         HStack {
@@ -2158,9 +2443,11 @@ private struct MessageBubbleRow: View {
                         StreamingMessageStatusView()
                     } else if message.showsActions {
                         AssistantMessageActionsView(
-                            messageText: message.text,
+                            isFavorited: message.isFavorite,
                             isAudioPlaying: playingMessageID == message.id,
-                            onAudioTap: { onAssistantAudioTap(message) }
+                            onCopyTap: { onAssistantCopyTap(message) },
+                            onAudioTap: { onAssistantAudioTap(message) },
+                            onFavoriteTap: { onAssistantFavoriteTap(message) }
                         )
                     }
                 }
@@ -2367,9 +2654,11 @@ private struct StreamingMessageStatusView: View {
 }
 
 private struct AssistantMessageActionsView: View {
-    let messageText: String
+    let isFavorited: Bool
     let isAudioPlaying: Bool
+    let onCopyTap: () -> Void
     let onAudioTap: () -> Void
+    let onFavoriteTap: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
@@ -2377,9 +2666,7 @@ private struct AssistantMessageActionsView: View {
                 systemImage: "doc.on.doc",
                 accessibilityLabel: "复制消息",
                 accessibilityIdentifier: "assistant_message_copy_button"
-            ) {
-                UIPasteboard.general.string = messageText
-            }
+            ) { onCopyTap() }
 
             actionButton(
                 systemImage: isAudioPlaying ? "stop.fill" : "speaker.wave.2.fill",
@@ -2389,10 +2676,10 @@ private struct AssistantMessageActionsView: View {
             )
 
             actionButton(
-                systemImage: "bookmark",
-                accessibilityLabel: "收藏消息",
+                systemImage: isFavorited ? "bookmark.fill" : "bookmark",
+                accessibilityLabel: isFavorited ? "取消收藏消息" : "收藏消息",
                 accessibilityIdentifier: "assistant_message_bookmark_button"
-            ) {}
+            ) { onFavoriteTap() }
         }
         .padding(.leading, 2)
     }

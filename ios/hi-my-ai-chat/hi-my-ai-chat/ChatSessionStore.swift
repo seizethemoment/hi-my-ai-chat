@@ -116,11 +116,13 @@ final class ChatSessionStore: ObservableObject {
         return session
     }
 
-    func updateMessages(_ messages: [ChatMessage], for sessionID: UUID) {
+    func updateMessages(_ messages: [ChatMessage], for sessionID: UUID, shouldRefreshTimestamp: Bool = true) {
         guard let index = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
 
         sessions[index].messages = messages
-        sessions[index].updatedAt = messages.isEmpty ? sessions[index].createdAt : Date()
+        if shouldRefreshTimestamp {
+            sessions[index].updatedAt = messages.isEmpty ? sessions[index].createdAt : Date()
+        }
         sessions = sortedSessions(sessions)
         save()
     }
@@ -287,6 +289,7 @@ private struct PersistedChatMessage: Codable {
     let attachments: [PersistedChatImageAttachment]
     let showsActions: Bool
     let state: String
+    let favoritedAt: Date?
 
     @MainActor
     init?(message: ChatMessage) {
@@ -301,6 +304,7 @@ private struct PersistedChatMessage: Codable {
         self.attachments = message.attachments.map(PersistedChatImageAttachment.init)
         self.showsActions = message.role == .assistant && trimmedText.isEmpty == false
         self.state = message.state == .failed ? "failed" : "complete"
+        self.favoritedAt = message.favoritedAt
     }
 
     var chatMessage: ChatMessage {
@@ -310,7 +314,8 @@ private struct PersistedChatMessage: Codable {
             text: text,
             attachments: attachments.map(\.attachment),
             showsActions: showsActions,
-            state: state == "failed" ? .failed : .complete
+            state: state == "failed" ? .failed : .complete,
+            favoritedAt: favoritedAt
         )
     }
 }
