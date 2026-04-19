@@ -5,7 +5,6 @@
 <p align="center">
   <img src="ios/hi-my-ai-chat/hi-my-ai-chat/Assets.xcassets/AppIcon.appiconset/HiChatIcon-1024.png" alt="HiChat App Icon" width="220" />
 </p>
-
 ## 应用截图
 
 | 文字聊天 | 图片理解 |
