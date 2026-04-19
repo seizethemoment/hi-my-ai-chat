@@ -2,6 +2,10 @@
 
 一个基于 SwiftUI 的 iOS 聊天应用，支持接入 OpenAI 兼容接口，提供流式回复、会话历史、搜索和语音输入。
 
+<p align="center">
+  <img src="ios/hi-my-ai-chat/hi-my-ai-chat/Assets.xcassets/AppIcon.appiconset/HiChatIcon-1024.png" alt="HiChat App Icon" width="220" />
+</p>
+
 ## 应用截图
 
 | 文字聊天 | 图片理解 |
