@@ -1,0 +1,15 @@
+.DS_Store
+**/.DS_Store
+
+# Xcode user-local files
+xcuserdata/
+**/xcuserdata/
+*.xcuserstate
+
+# Build artifacts
+DerivedData/
+build/
+
+# Swift Package Manager
+.build/
+.swiftpm/
