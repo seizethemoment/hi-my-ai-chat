@@ -47,7 +47,7 @@ struct SettingsView: View {
                                 .foregroundStyle(Color.black.opacity(0.38))
 
                             VStack(alignment: .leading, spacing: 12) {
-                                Text("聊天回复会读取这里配置的 API Key、Base URL 和 Model。输入后会保存在本机，下次打开仍会记住；API Key 在展示时会自动脱敏。")
+                                Text("聊天回复会读取这里配置的 API Key、Base URL 和 Model。输入后会保存在本机，下次打开仍会记住；API Key 在展示时会自动脱敏。若要使用日期、定位、实时天气、未来天气预报等工具能力，Base URL 需要兼容 OpenAI function calling。")
                                     .font(.system(size: 13, weight: .medium))
                                     .foregroundStyle(Color.black.opacity(0.44))
                                     .fixedSize(horizontal: false, vertical: true)

@@ -257,6 +257,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = HiChat;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_NSCameraUsageDescription = "用于拍照后把图片发给模型进行识别和问答。";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "用于获取你的当前位置，并支持位置和天气相关问答。";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "用于按住说话录音并转写你的语音内容。";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "用于从相册选择图片并发送给模型。";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "用于将你的语音实时识别成文字并发送消息。";
@@ -297,6 +298,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = HiChat;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_NSCameraUsageDescription = "用于拍照后把图片发给模型进行识别和问答。";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "用于获取你的当前位置，并支持位置和天气相关问答。";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "用于按住说话录音并转写你的语音内容。";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "用于从相册选择图片并发送给模型。";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "用于将你的语音实时识别成文字并发送消息。";
