@@ -341,6 +341,7 @@ struct ContentView: View {
                     canDeleteMessages: isRequestingReply == false,
                     playingMessageID: voicePlaybackController.playingMessageID,
                     onDeleteMessage: deleteMessage,
+                    onUserCopyTap: handleUserMessageCopy,
                     onAssistantCopyTap: handleAssistantMessageCopy,
                     onAssistantAudioTap: toggleAssistantMessageAudio,
                     onAssistantFavoriteTap: toggleAssistantMessageFavorite
@@ -1300,6 +1301,11 @@ struct ContentView: View {
     }
 
     private func handleAssistantMessageCopy(_ message: ChatMessage) {
+        UIPasteboard.general.string = message.text
+        presentToast("已复制到剪贴板")
+    }
+
+    private func handleUserMessageCopy(_ message: ChatMessage) {
         UIPasteboard.general.string = message.text
         presentToast("已复制到剪贴板")
     }

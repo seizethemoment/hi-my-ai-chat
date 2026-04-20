@@ -6,6 +6,7 @@ struct ChatMessagesView: View {
     let canDeleteMessages: Bool
     let playingMessageID: UUID?
     let onDeleteMessage: (ChatMessage) -> Void
+    let onUserCopyTap: (ChatMessage) -> Void
     let onAssistantCopyTap: (ChatMessage) -> Void
     let onAssistantAudioTap: (ChatMessage) -> Void
     let onAssistantFavoriteTap: (ChatMessage) -> Void
@@ -27,6 +28,7 @@ struct ChatMessagesView: View {
                                     canDelete: canDeleteMessages,
                                     playingMessageID: playingMessageID,
                                     onDelete: onDeleteMessage,
+                                    onUserCopyTap: onUserCopyTap,
                                     onAssistantCopyTap: onAssistantCopyTap,
                                     onAssistantAudioTap: onAssistantAudioTap,
                                     onAssistantFavoriteTap: onAssistantFavoriteTap
@@ -90,6 +92,7 @@ private struct MessageBubbleRow: View {
     let canDelete: Bool
     let playingMessageID: UUID?
     let onDelete: (ChatMessage) -> Void
+    let onUserCopyTap: (ChatMessage) -> Void
     let onAssistantCopyTap: (ChatMessage) -> Void
     let onAssistantAudioTap: (ChatMessage) -> Void
     let onAssistantFavoriteTap: (ChatMessage) -> Void
@@ -131,6 +134,15 @@ private struct MessageBubbleRow: View {
         .frame(maxWidth: .infinity)
         .id(message.id)
         .contextMenu {
+            if message.role == .user,
+               message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+                Button {
+                    onUserCopyTap(message)
+                } label: {
+                    Label("复制内容", systemImage: "doc.on.doc")
+                }
+            }
+
             if canDelete {
                 Button(role: .destructive) {
                     onDelete(message)

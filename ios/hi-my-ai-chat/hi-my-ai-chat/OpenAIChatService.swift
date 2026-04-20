@@ -140,6 +140,22 @@ struct OpenAIChatService: ChatServiceProtocol, Sendable {
     }
 
     private struct ResponseBody: Decodable, Sendable {
+        struct Usage: Decodable, Sendable {
+            struct PromptTokensDetails: Decodable, Sendable {
+                let cachedTokens: Int?
+            }
+
+            struct CompletionTokensDetails: Decodable, Sendable {
+                let reasoningTokens: Int?
+            }
+
+            let promptTokens: Int?
+            let completionTokens: Int?
+            let totalTokens: Int?
+            let promptTokensDetails: PromptTokensDetails?
+            let completionTokensDetails: CompletionTokensDetails?
+        }
+
         struct Choice: Decodable, Sendable {
             struct Message: Decodable, Sendable {
                 let role: OpenAIChatRole
@@ -152,6 +168,7 @@ struct OpenAIChatService: ChatServiceProtocol, Sendable {
         }
 
         let choices: [Choice]
+        let usage: Usage?
     }
 
     private struct ErrorBody: Decodable, Sendable {
@@ -229,32 +246,61 @@ struct OpenAIChatService: ChatServiceProtocol, Sendable {
         onDelta: @escaping @Sendable (String) async -> Void
     ) async throws -> String {
         let requestMessages = makeRequestMessages(for: conversation)
+        var observability = ChatObservabilityRunBuilder(
+            model: model,
+            baseURL: baseURL,
+            conversation: conversation,
+            requestTurnCount: requestMessages.count
+        )
 
-        for attempt in 0...maxRetryCount {
-            do {
-                let reply = try await completeReply(
-                    messages: requestMessages,
-                    timeoutInterval: timeoutInterval
-                )
-                await onDelta(reply)
-                return reply
-            } catch {
-                let shouldRetry = attempt < maxRetryCount && shouldRetry(after: error)
-                guard shouldRetry else {
-                    throw error
+        do {
+            for attempt in 0...maxRetryCount {
+                do {
+                    let reply = try await completeReply(
+                        messages: requestMessages,
+                        timeoutInterval: timeoutInterval,
+                        observability: &observability
+                    )
+                    await onDelta(reply)
+                    await ChatObservabilityStore.shared.record(
+                        observability.build(
+                            status: .success,
+                            outputText: reply,
+                            errorDescription: nil
+                        )
+                    )
+                    return reply
+                } catch {
+                    let shouldRetry = attempt < maxRetryCount && shouldRetry(after: error)
+                    guard shouldRetry else {
+                        throw error
+                    }
+
+                    observability.recordRetry(attempt + 1)
+                    await onRetry?(attempt + 1)
+                    try await Task.sleep(nanoseconds: 800_000_000)
                 }
-
-                await onRetry?(attempt + 1)
-                try await Task.sleep(nanoseconds: 800_000_000)
             }
-        }
 
-        throw OpenAIChatServiceError.invalidResponse
+            throw OpenAIChatServiceError.invalidResponse
+        } catch {
+            let status: ChatObservabilityRunRecord.Status = error is CancellationError ? .cancelled : .failure
+            let errorDescription = error is CancellationError ? nil : error.localizedDescription
+            await ChatObservabilityStore.shared.record(
+                observability.build(
+                    status: status,
+                    outputText: nil,
+                    errorDescription: errorDescription
+                )
+            )
+            throw error
+        }
     }
 
     private func completeReply(
         messages initialMessages: [RequestMessage],
-        timeoutInterval: TimeInterval
+        timeoutInterval: TimeInterval,
+        observability: inout ChatObservabilityRunBuilder
     ) async throws -> String {
         var messages = initialMessages
         let session = makeURLSession(timeoutInterval: timeoutInterval)
@@ -269,77 +315,197 @@ struct OpenAIChatService: ChatServiceProtocol, Sendable {
                 timeoutInterval: timeoutInterval,
                 requestID: requestID
             )
+            let roundStartedAt = Date()
+            var didRecordRound = false
 
             AppLog.chatTools("round=\(round) client_request_id=\(requestID) message_count=\(messages.count)")
 
-            let (data, response) = try await session.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw OpenAIChatServiceError.invalidResponse
-            }
+            do {
+                let (data, response) = try await session.data(for: request)
+                let durationMilliseconds = elapsedMilliseconds(since: roundStartedAt)
 
-            AppLog.chatTools(
-                "round=\(round) status=\(httpResponse.statusCode) x_request_id=\(httpResponse.value(forHTTPHeaderField: "x-request-id") ?? "-")"
-            )
-
-            guard 200 ..< 300 ~= httpResponse.statusCode else {
-                throw parseServerError(statusCode: httpResponse.statusCode, data: data)
-            }
-
-            let decoded = try jsonDecoder.decode(ResponseBody.self, from: data)
-            guard let choice = decoded.choices.first else {
-                throw OpenAIChatServiceError.invalidResponse
-            }
-
-            let toolCalls = choice.message.toolCalls ?? []
-            let trimmedContent = choice.message.content?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let toolNames = toolCalls.map(\.function.name).joined(separator: ",")
-
-            AppLog.chatTools(
-                "round=\(round) finish_reason=\(choice.finishReason ?? "-") tool_calls=\(toolCalls.count) tool_names=\(toolNames.isEmpty ? "-" : toolNames) content_chars=\(trimmedContent?.count ?? 0)"
-            )
-
-            if toolCalls.isEmpty {
-                guard let reply = trimmedContent, reply.isEmpty == false else {
-                    throw OpenAIChatServiceError.emptyReply
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    observability.recordRound(
+                        roundIndex: round,
+                        clientRequestID: requestID,
+                        startedAt: roundStartedAt,
+                        durationMilliseconds: durationMilliseconds,
+                        statusCode: nil,
+                        finishReason: nil,
+                        xRequestID: nil,
+                        toolNames: [],
+                        responseCharacterCount: 0,
+                        usage: ChatObservabilityUsage(),
+                        errorDescription: OpenAIChatServiceError.invalidResponse.localizedDescription
+                    )
+                    didRecordRound = true
+                    throw OpenAIChatServiceError.invalidResponse
                 }
 
-                AppLog.chatTools("final_reply_chars=\(reply.count)")
-                return reply
-            }
-
-            messages.append(
-                RequestMessage(
-                    role: .assistant,
-                    content: choice.message.content.map(RequestMessage.Content.text),
-                    toolCallID: nil,
-                    toolCalls: toolCalls
-                )
-            )
-
-            for toolCall in toolCalls {
-                AppLog.chatTools(
-                    "tool_call round=\(round) id=\(toolCall.id) name=\(toolCall.function.name) arguments=\(toolCall.function.arguments)"
-                )
-
-                let toolOutput = await toolExecutor.execute(
-                    named: toolCall.function.name,
-                    argumentsJSON: toolCall.function.arguments
-                )
-                let truncatedOutput = truncateForLog(toolOutput)
+                let statusCode = httpResponse.statusCode
+                let xRequestID = httpResponse.value(forHTTPHeaderField: "x-request-id")
 
                 AppLog.chatTools(
-                    "tool_output round=\(round) id=\(toolCall.id) name=\(toolCall.function.name) output=\(truncatedOutput)"
+                    "round=\(round) status=\(statusCode) x_request_id=\(xRequestID ?? "-")"
                 )
+
+                guard 200 ..< 300 ~= statusCode else {
+                    let serverError = parseServerError(statusCode: statusCode, data: data)
+                    observability.recordRound(
+                        roundIndex: round,
+                        clientRequestID: requestID,
+                        startedAt: roundStartedAt,
+                        durationMilliseconds: durationMilliseconds,
+                        statusCode: statusCode,
+                        finishReason: nil,
+                        xRequestID: xRequestID,
+                        toolNames: [],
+                        responseCharacterCount: 0,
+                        usage: ChatObservabilityUsage(),
+                        errorDescription: serverError.localizedDescription
+                    )
+                    didRecordRound = true
+                    throw serverError
+                }
+
+                let decoded: ResponseBody
+                do {
+                    decoded = try jsonDecoder.decode(ResponseBody.self, from: data)
+                } catch {
+                    observability.recordRound(
+                        roundIndex: round,
+                        clientRequestID: requestID,
+                        startedAt: roundStartedAt,
+                        durationMilliseconds: durationMilliseconds,
+                        statusCode: statusCode,
+                        finishReason: nil,
+                        xRequestID: xRequestID,
+                        toolNames: [],
+                        responseCharacterCount: 0,
+                        usage: ChatObservabilityUsage(),
+                        errorDescription: OpenAIChatServiceError.invalidResponse.localizedDescription
+                    )
+                    didRecordRound = true
+                    throw OpenAIChatServiceError.invalidResponse
+                }
+
+                guard let choice = decoded.choices.first else {
+                    observability.recordRound(
+                        roundIndex: round,
+                        clientRequestID: requestID,
+                        startedAt: roundStartedAt,
+                        durationMilliseconds: durationMilliseconds,
+                        statusCode: statusCode,
+                        finishReason: nil,
+                        xRequestID: xRequestID,
+                        toolNames: [],
+                        responseCharacterCount: 0,
+                        usage: makeObservabilityUsage(from: decoded.usage),
+                        errorDescription: OpenAIChatServiceError.invalidResponse.localizedDescription
+                    )
+                    didRecordRound = true
+                    throw OpenAIChatServiceError.invalidResponse
+                }
+
+                let toolCalls = choice.message.toolCalls ?? []
+                let trimmedContent = choice.message.content?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let toolNames = toolCalls.map(\.function.name)
+                let usage = makeObservabilityUsage(from: decoded.usage)
+
+                AppLog.chatTools(
+                    "round=\(round) finish_reason=\(choice.finishReason ?? "-") tool_calls=\(toolCalls.count) tool_names=\(toolNames.isEmpty ? "-" : toolNames.joined(separator: ",")) content_chars=\(trimmedContent?.count ?? 0)"
+                )
+
+                observability.recordRound(
+                    roundIndex: round,
+                    clientRequestID: requestID,
+                    startedAt: roundStartedAt,
+                    durationMilliseconds: durationMilliseconds,
+                    statusCode: statusCode,
+                    finishReason: choice.finishReason,
+                    xRequestID: xRequestID,
+                    toolNames: toolNames,
+                    responseCharacterCount: trimmedContent?.count ?? 0,
+                    usage: usage,
+                    errorDescription: nil
+                )
+                didRecordRound = true
+
+                if toolCalls.isEmpty {
+                    guard let reply = trimmedContent, reply.isEmpty == false else {
+                        throw OpenAIChatServiceError.emptyReply
+                    }
+
+                    AppLog.chatTools("final_reply_chars=\(reply.count)")
+                    return reply
+                }
 
                 messages.append(
                     RequestMessage(
-                        role: .tool,
-                        content: .text(toolOutput),
-                        toolCallID: toolCall.id,
-                        toolCalls: nil
+                        role: .assistant,
+                        content: choice.message.content.map(RequestMessage.Content.text),
+                        toolCallID: nil,
+                        toolCalls: toolCalls
                     )
                 )
+
+                for toolCall in toolCalls {
+                    AppLog.chatTools(
+                        "tool_call round=\(round) id=\(toolCall.id) name=\(toolCall.function.name) arguments=\(toolCall.function.arguments)"
+                    )
+
+                    let toolStartedAt = Date()
+                    let toolOutput = await toolExecutor.execute(
+                        named: toolCall.function.name,
+                        argumentsJSON: toolCall.function.arguments
+                    )
+                    let toolDurationMilliseconds = elapsedMilliseconds(since: toolStartedAt)
+                    let toolErrorDescription = toolErrorDescription(from: toolOutput)
+                    let truncatedOutput = truncateForLog(toolOutput)
+
+                    AppLog.chatTools(
+                        "tool_output round=\(round) id=\(toolCall.id) name=\(toolCall.function.name) output=\(truncatedOutput)"
+                    )
+
+                    observability.recordToolCall(
+                        roundIndex: round,
+                        toolCallID: toolCall.id,
+                        name: toolCall.function.name,
+                        startedAt: toolStartedAt,
+                        durationMilliseconds: toolDurationMilliseconds,
+                        argumentsJSON: toolCall.function.arguments,
+                        output: toolOutput,
+                        errorDescription: toolErrorDescription
+                    )
+
+                    messages.append(
+                        RequestMessage(
+                            role: .tool,
+                            content: .text(toolOutput),
+                            toolCallID: toolCall.id,
+                            toolCalls: nil
+                        )
+                    )
+                }
+            } catch {
+                if didRecordRound == false, error is CancellationError == false {
+                    observability.recordRound(
+                        roundIndex: round,
+                        clientRequestID: requestID,
+                        startedAt: roundStartedAt,
+                        durationMilliseconds: elapsedMilliseconds(since: roundStartedAt),
+                        statusCode: nil,
+                        finishReason: nil,
+                        xRequestID: nil,
+                        toolNames: [],
+                        responseCharacterCount: 0,
+                        usage: ChatObservabilityUsage(),
+                        errorDescription: error.localizedDescription
+                    )
+                }
+
+                throw error
             }
         }
 
@@ -577,6 +743,35 @@ struct OpenAIChatService: ChatServiceProtocol, Sendable {
         configuration.timeoutIntervalForResource = timeoutInterval
         configuration.waitsForConnectivity = true
         return URLSession(configuration: configuration)
+    }
+
+    private func makeObservabilityUsage(from usage: ResponseBody.Usage?) -> ChatObservabilityUsage {
+        ChatObservabilityUsage(
+            promptTokens: usage?.promptTokens,
+            completionTokens: usage?.completionTokens,
+            totalTokens: usage?.totalTokens,
+            cachedPromptTokens: usage?.promptTokensDetails?.cachedTokens,
+            reasoningTokens: usage?.completionTokensDetails?.reasoningTokens
+        )
+    }
+
+    private func toolErrorDescription(from output: String) -> String? {
+        struct ToolOutputEnvelope: Decodable {
+            let ok: Bool?
+            let error: String?
+        }
+
+        guard let data = output.data(using: .utf8),
+              let envelope = try? jsonDecoder.decode(ToolOutputEnvelope.self, from: data),
+              envelope.ok == false else {
+            return nil
+        }
+
+        return envelope.error?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func elapsedMilliseconds(since start: Date) -> Int {
+        max(Int(Date().timeIntervalSince(start) * 1_000), 0)
     }
 
     private func truncateForLog(_ value: String, limit: Int = 400) -> String {
