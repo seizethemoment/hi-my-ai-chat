@@ -6,6 +6,6 @@ protocol ChatServiceProtocol: Sendable {
         timeoutInterval: TimeInterval,
         maxRetryCount: Int,
         onRetry: (@Sendable (Int) async -> Void)?,
-        onDelta: @escaping @Sendable (String) async -> Void
+        onEvent: @escaping @Sendable (ChatStreamEvent) async -> Void
     ) async throws -> String
 }

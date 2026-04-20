@@ -10,6 +10,12 @@ import PhotosUI
 import UIKit
 
 struct ContentView: View {
+    private enum DemoStreamStep {
+        case pause(UInt64)
+        case text(String)
+        case tool(ChatToolCall)
+    }
+
     @StateObject private var sessionStore = ChatSessionStore()
     @StateObject private var voiceInputController = VoiceInputController()
     @StateObject private var voicePlaybackController = VoicePlaybackController()
@@ -55,16 +61,65 @@ struct ContentView: View {
     private let conversationContextBuilder = ConversationContextBuilder()
 
     private let quickActions = [
-        QuickAction(title: "写一首关于季节的古诗", systemImage: "leaf", prompt: "写一首关于季节的古诗"),
-        QuickAction(title: "讲一个笑话给我听", systemImage: "face.smiling", prompt: "讲一个笑话给我听"),
-        QuickAction(title: "随便说点什么", systemImage: "ellipsis.bubble", prompt: "随便说点什么")
+        QuickAction(
+            id: "rich_streaming_demo",
+            title: "流式渲染验收",
+            systemImage: "sparkles.rectangle.stack",
+            scenario: .richStreaming,
+            accessibilityIdentifier: "quick_action_rich_streaming_demo"
+        ),
+        QuickAction(
+            id: "tool_failure_demo",
+            title: "失败态验收",
+            systemImage: "exclamationmark.triangle",
+            scenario: .toolFailure,
+            accessibilityIdentifier: "quick_action_tool_failure_demo"
+        ),
+        QuickAction(
+            id: "season_poem",
+            title: "写一首关于季节的古诗",
+            systemImage: "leaf",
+            prompt: "写一首关于季节的古诗",
+            accessibilityIdentifier: "quick_action_season_poem"
+        ),
+        QuickAction(
+            id: "tell_joke",
+            title: "讲一个笑话给我听",
+            systemImage: "face.smiling",
+            prompt: "讲一个笑话给我听",
+            accessibilityIdentifier: "quick_action_tell_joke"
+        )
     ]
 
     private let imageQuickActions = [
-        QuickAction(title: "这是什么", systemImage: "questionmark.circle", prompt: "这是什么？"),
-        QuickAction(title: "图片配文", systemImage: "text.quote", prompt: "帮我为这张图片写一段配文。"),
-        QuickAction(title: "提取图中文字", systemImage: "text.viewfinder", prompt: "请提取这张图片里的所有文字。"),
-        QuickAction(title: "翻译图中文字", systemImage: "globe", prompt: "请识别并翻译这张图片里的文字。")
+        QuickAction(
+            id: "describe_image",
+            title: "这是什么",
+            systemImage: "questionmark.circle",
+            prompt: "这是什么？",
+            accessibilityIdentifier: "quick_action_describe_image"
+        ),
+        QuickAction(
+            id: "image_caption",
+            title: "图片配文",
+            systemImage: "text.quote",
+            prompt: "帮我为这张图片写一段配文。",
+            accessibilityIdentifier: "quick_action_image_caption"
+        ),
+        QuickAction(
+            id: "extract_text",
+            title: "提取图中文字",
+            systemImage: "text.viewfinder",
+            prompt: "请提取这张图片里的所有文字。",
+            accessibilityIdentifier: "quick_action_extract_text"
+        ),
+        QuickAction(
+            id: "translate_text",
+            title: "翻译图中文字",
+            systemImage: "globe",
+            prompt: "请识别并翻译这张图片里的文字。",
+            accessibilityIdentifier: "quick_action_translate_text"
+        )
     ]
 
     private let attachmentActions = [
@@ -901,7 +956,13 @@ struct ContentView: View {
     }
 
     private func applyQuickAction(_ action: QuickAction) {
-        inputText = action.prompt
+        if let scenario = action.scenario {
+            runDemoScenario(scenario)
+            return
+        }
+
+        guard let prompt = action.prompt else { return }
+        inputText = prompt
         prefersTextInput = true
         isAttachmentDrawerPresented = false
         focusComposerTextField()
@@ -1087,11 +1148,58 @@ struct ContentView: View {
             attachments: attachments,
             showsActions: false
         )
-        let conversationSnapshot = messages + [newUserMessage]
         let assistantMessageID = UUID()
+        let conversationSnapshot = beginStreamingAssistantTurn(
+            with: newUserMessage,
+            assistantMessageID: assistantMessageID,
+            in: currentSessionID
+        )
+
+        replyTasks[currentSessionID]?.cancel()
+        replyTasks[currentSessionID] = Task {
+            await generateAssistantReply(
+                for: conversationSnapshot,
+                assistantMessageID: assistantMessageID,
+                sessionID: currentSessionID
+            )
+        }
+    }
+
+    private func runDemoScenario(_ scenario: ChatDemoScenario) {
+        guard let currentSessionID, isRequestingReply == false else { return }
+
+        let userMessage = ChatMessage(
+            role: .user,
+            text: demoScenarioPrompt(for: scenario),
+            showsActions: false
+        )
+        let assistantMessageID = UUID()
+        _ = beginStreamingAssistantTurn(
+            with: userMessage,
+            assistantMessageID: assistantMessageID,
+            in: currentSessionID
+        )
+
+        replyTasks[currentSessionID]?.cancel()
+        replyTasks[currentSessionID] = Task {
+            await playDemoScenario(
+                scenario,
+                assistantMessageID: assistantMessageID,
+                sessionID: currentSessionID
+            )
+        }
+    }
+
+    @discardableResult
+    private func beginStreamingAssistantTurn(
+        with userMessage: ChatMessage,
+        assistantMessageID: UUID,
+        in sessionID: UUID
+    ) -> [ChatMessage] {
+        let conversationSnapshot = messages + [userMessage]
 
         withAnimation(.spring(response: 0.30, dampingFraction: 0.82)) {
-            messages.append(newUserMessage)
+            messages.append(userMessage)
             messages.append(
                 ChatMessage(
                     id: assistantMessageID,
@@ -1113,21 +1221,13 @@ struct ContentView: View {
         isRequestingReply = true
         currentRetryAttempt = 0
         activeAssistantMessageID = assistantMessageID
-        retryAttemptsBySession[currentSessionID] = 0
-        activeAssistantMessageIDsBySession[currentSessionID] = assistantMessageID
-        updateMessages(messages, for: currentSessionID)
+        retryAttemptsBySession[sessionID] = 0
+        activeAssistantMessageIDsBySession[sessionID] = assistantMessageID
+        updateMessages(messages, for: sessionID)
         scrollToBottomRequest += 1
         dismissKeyboard()
         persistCurrentSession()
-
-        replyTasks[currentSessionID]?.cancel()
-        replyTasks[currentSessionID] = Task {
-            await generateAssistantReply(
-                for: conversationSnapshot,
-                assistantMessageID: assistantMessageID,
-                sessionID: currentSessionID
-            )
-        }
+        return conversationSnapshot
     }
 
     private func generateAssistantReply(
@@ -1135,17 +1235,10 @@ struct ContentView: View {
         assistantMessageID: UUID,
         sessionID: UUID
     ) async {
-        let typingBuffer = TypewriterBuffer()
-        let typingStream = await typingBuffer.stream()
-        let typewriterTask = Task {
-            await playTypewriter(
-                from: typingStream,
-                assistantMessageID: assistantMessageID,
-                sessionID: sessionID
-            )
-        }
-
-        do {
+        await streamAssistantReply(
+            assistantMessageID: assistantMessageID,
+            sessionID: sessionID
+        ) { typingBuffer in
             let configuration = OpenAIModelConfiguration(
                 apiKey: openAIAPIKey,
                 baseURL: openAIBaseURL,
@@ -1165,11 +1258,55 @@ struct ContentView: View {
                         }
                     }
                 },
-                onDelta: { delta in
-                    await typingBuffer.enqueue(delta)
+                onEvent: { event in
+                    await handleStreamEvent(
+                        event,
+                        with: typingBuffer,
+                        assistantMessageID: assistantMessageID,
+                        sessionID: sessionID
+                    )
                 }
             )
+            return reply
+        }
+    }
 
+    private func playDemoScenario(
+        _ scenario: ChatDemoScenario,
+        assistantMessageID: UUID,
+        sessionID: UUID
+    ) async {
+        await streamAssistantReply(
+            assistantMessageID: assistantMessageID,
+            sessionID: sessionID
+        ) { typingBuffer in
+            try await playDemoScenarioSteps(
+                demoScenarioSteps(for: scenario),
+                typingBuffer: typingBuffer,
+                assistantMessageID: assistantMessageID,
+                sessionID: sessionID
+            )
+            return demoScenarioFinalText(for: scenario)
+        }
+    }
+
+    private func streamAssistantReply(
+        assistantMessageID: UUID,
+        sessionID: UUID,
+        producer: @escaping @Sendable (TypewriterBuffer) async throws -> String
+    ) async {
+        let typingBuffer = TypewriterBuffer()
+        let typingStream = await typingBuffer.stream()
+        let typewriterTask = Task {
+            await playTypewriter(
+                from: typingStream,
+                assistantMessageID: assistantMessageID,
+                sessionID: sessionID
+            )
+        }
+
+        do {
+            let reply = try await producer(typingBuffer)
             await typingBuffer.finish()
             await typewriterTask.value
 
@@ -1228,6 +1365,52 @@ struct ContentView: View {
         }
     }
 
+    private func handleStreamEvent(
+        _ event: ChatStreamEvent,
+        with typingBuffer: TypewriterBuffer,
+        assistantMessageID: UUID,
+        sessionID: UUID
+    ) async {
+        switch event {
+        case .textDelta(let delta):
+            await typingBuffer.enqueue(delta)
+        case .toolCall(let toolCall):
+            await MainActor.run {
+                upsertToolCall(toolCall, on: assistantMessageID, in: sessionID)
+            }
+        }
+    }
+
+    private func playDemoScenarioSteps(
+        _ steps: [DemoStreamStep],
+        typingBuffer: TypewriterBuffer,
+        assistantMessageID: UUID,
+        sessionID: UUID
+    ) async throws {
+        for step in steps {
+            try Task.checkCancellation()
+
+            switch step {
+            case .pause(let duration):
+                try await Task.sleep(nanoseconds: duration)
+            case .text(let value):
+                await handleStreamEvent(
+                    .textDelta(value),
+                    with: typingBuffer,
+                    assistantMessageID: assistantMessageID,
+                    sessionID: sessionID
+                )
+            case .tool(let toolCall):
+                await handleStreamEvent(
+                    .toolCall(toolCall),
+                    with: typingBuffer,
+                    assistantMessageID: assistantMessageID,
+                    sessionID: sessionID
+                )
+            }
+        }
+    }
+
     private func playTypewriter(
         from stream: AsyncStream<String>,
         assistantMessageID: UUID,
@@ -1249,6 +1432,26 @@ struct ContentView: View {
         sessionMessages[index].state = .streaming
         sessionMessages[index].showsActions = false
         updateMessages(sessionMessages, for: sessionID)
+
+        if currentSessionID == sessionID {
+            currentRetryAttempt = 0
+        }
+    }
+
+    private func upsertToolCall(_ toolCall: ChatToolCall, on messageID: UUID, in sessionID: UUID) {
+        var sessionMessages = messages(for: sessionID)
+        guard let messageIndex = sessionMessages.firstIndex(where: { $0.id == messageID }) else { return }
+
+        if let toolCallIndex = sessionMessages[messageIndex].toolCalls.firstIndex(where: { $0.id == toolCall.id }) {
+            sessionMessages[messageIndex].toolCalls[toolCallIndex] = toolCall
+        } else {
+            sessionMessages[messageIndex].toolCalls.append(toolCall)
+        }
+
+        sessionMessages[messageIndex].state = .streaming
+        sessionMessages[messageIndex].showsActions = false
+        updateMessages(sessionMessages, for: sessionID)
+        scrollToBottomRequest += 1
 
         if currentSessionID == sessionID {
             currentRetryAttempt = 0
@@ -1281,6 +1484,134 @@ struct ContentView: View {
         sessionMessages[index].showsActions = false
         updateMessages(sessionMessages, for: sessionID)
         return sessionMessages
+    }
+
+    private func demoScenarioPrompt(for scenario: ChatDemoScenario) -> String {
+        switch scenario {
+        case .richStreaming:
+            return "请演示支持 Markdown、代码块和 Tool Call 卡片的流式渲染。"
+        case .toolFailure:
+            return "请演示工具调用失败时的流式卡片状态。"
+        }
+    }
+
+    private func demoScenarioFinalText(for scenario: ChatDemoScenario) -> String {
+        switch scenario {
+        case .richStreaming:
+            return """
+            ### 流式渲染验收
+
+            - Markdown 列表会边生成边排版
+            - Tool Call 卡片会先于正文出现
+            - 代码块在围栏闭合前也会保留代码样式
+
+            > 上方的时间与天气预报卡片，就是和正文混排的流式组件。
+
+            ```swift
+            struct StreamRenderer {
+                func renderNextFrame() {
+                    print("markdown + code + tool cards")
+                }
+            }
+            ```
+
+            最后一段正文会继续按字追加，验证完整回复结束后，卡片与代码块都保持稳定布局。
+            """
+        case .toolFailure:
+            return """
+            ### Tool Call 失败态
+
+            - 当工具返回错误时，卡片会切换到失败样式
+            - 参数与结果依然保留，方便排查
+
+            上方卡片模拟的是“定位权限未开启”的场景，正文会继续流式输出，不会因为单个工具失败导致整个渲染链路中断。
+            """
+        }
+    }
+
+    private func demoScenarioSteps(for scenario: ChatDemoScenario) -> [DemoStreamStep] {
+        switch scenario {
+        case .richStreaming:
+            return [
+                .pause(220_000_000),
+                .tool(
+                    ChatToolCall(
+                        id: "demo_datetime",
+                        name: "get_current_datetime",
+                        argumentsJSON: "{}",
+                        output: nil,
+                        status: .running
+                    )
+                ),
+                .pause(420_000_000),
+                .tool(
+                    ChatToolCall(
+                        id: "demo_datetime",
+                        name: "get_current_datetime",
+                        argumentsJSON: "{}",
+                        output: """
+                        {"ok":true,"calendarDate":"2026-04-20","timeText":"14:32","weekdayText":"星期一","timeZoneIdentifier":"Asia/Shanghai"}
+                        """,
+                        status: .succeeded
+                    )
+                ),
+                .pause(220_000_000),
+                .tool(
+                    ChatToolCall(
+                        id: "demo_forecast",
+                        name: "get_weather_forecast",
+                        argumentsJSON: """
+                        {"locationQuery":"上海","useCurrentLocation":false,"startDayOffset":1,"dayCount":2}
+                        """,
+                        output: nil,
+                        status: .running
+                    )
+                ),
+                .pause(620_000_000),
+                .tool(
+                    ChatToolCall(
+                        id: "demo_forecast",
+                        name: "get_weather_forecast",
+                        argumentsJSON: """
+                        {"locationQuery":"上海","useCurrentLocation":false,"startDayOffset":1,"dayCount":2}
+                        """,
+                        output: """
+                        {"ok":true,"locationName":"上海","dailyForecasts":[{"date":"2026-04-21","weatherSummary":"多云","maxTemperatureCelsius":24,"minTemperatureCelsius":17},{"date":"2026-04-22","weatherSummary":"小雨","maxTemperatureCelsius":22,"minTemperatureCelsius":16}]}
+                        """,
+                        status: .succeeded
+                    )
+                ),
+                .pause(260_000_000),
+                .text(demoScenarioFinalText(for: .richStreaming))
+            ]
+        case .toolFailure:
+            return [
+                .pause(180_000_000),
+                .tool(
+                    ChatToolCall(
+                        id: "demo_location",
+                        name: "get_current_location",
+                        argumentsJSON: "{}",
+                        output: nil,
+                        status: .running
+                    )
+                ),
+                .pause(480_000_000),
+                .tool(
+                    ChatToolCall(
+                        id: "demo_location",
+                        name: "get_current_location",
+                        argumentsJSON: "{}",
+                        output: """
+                        {"ok":false,"error":"定位权限未开启，请在系统设置中允许访问当前位置。"}
+                        """,
+                        status: .failed
+                    )
+                ),
+                .pause(200_000_000),
+                .text(demoScenarioFinalText(for: .toolFailure))
+            ]
+        }
     }
 
     private func typewriterDelay(for character: String) -> UInt64 {

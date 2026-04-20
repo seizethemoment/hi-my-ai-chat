@@ -243,7 +243,7 @@ struct OpenAIChatService: ChatServiceProtocol, Sendable {
         timeoutInterval: TimeInterval = 45,
         maxRetryCount: Int = 1,
         onRetry: (@Sendable (Int) async -> Void)? = nil,
-        onDelta: @escaping @Sendable (String) async -> Void
+        onEvent: @escaping @Sendable (ChatStreamEvent) async -> Void
     ) async throws -> String {
         let requestMessages = makeRequestMessages(for: conversation)
         var observability = ChatObservabilityRunBuilder(
@@ -259,9 +259,10 @@ struct OpenAIChatService: ChatServiceProtocol, Sendable {
                     let reply = try await completeReply(
                         messages: requestMessages,
                         timeoutInterval: timeoutInterval,
-                        observability: &observability
+                        observability: &observability,
+                        onEvent: onEvent
                     )
-                    await onDelta(reply)
+                    await onEvent(.textDelta(reply))
                     await ChatObservabilityStore.shared.record(
                         observability.build(
                             status: .success,
@@ -300,7 +301,8 @@ struct OpenAIChatService: ChatServiceProtocol, Sendable {
     private func completeReply(
         messages initialMessages: [RequestMessage],
         timeoutInterval: TimeInterval,
-        observability: inout ChatObservabilityRunBuilder
+        observability: inout ChatObservabilityRunBuilder,
+        onEvent: @escaping @Sendable (ChatStreamEvent) async -> Void
     ) async throws -> String {
         var messages = initialMessages
         let session = makeURLSession(timeoutInterval: timeoutInterval)
@@ -455,6 +457,18 @@ struct OpenAIChatService: ChatServiceProtocol, Sendable {
                         "tool_call round=\(round) id=\(toolCall.id) name=\(toolCall.function.name) arguments=\(toolCall.function.arguments)"
                     )
 
+                    await onEvent(
+                        .toolCall(
+                            ChatToolCall(
+                                id: toolCall.id,
+                                name: toolCall.function.name,
+                                argumentsJSON: toolCall.function.arguments,
+                                output: nil,
+                                status: .running
+                            )
+                        )
+                    )
+
                     let toolStartedAt = Date()
                     let toolOutput = await toolExecutor.execute(
                         named: toolCall.function.name,
@@ -466,6 +480,18 @@ struct OpenAIChatService: ChatServiceProtocol, Sendable {
 
                     AppLog.chatTools(
                         "tool_output round=\(round) id=\(toolCall.id) name=\(toolCall.function.name) output=\(truncatedOutput)"
+                    )
+
+                    await onEvent(
+                        .toolCall(
+                            ChatToolCall(
+                                id: toolCall.id,
+                                name: toolCall.function.name,
+                                argumentsJSON: toolCall.function.arguments,
+                                output: toolOutput,
+                                status: toolErrorDescription == nil ? .succeeded : .failed
+                            )
+                        )
                     )
 
                     observability.recordToolCall(

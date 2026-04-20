@@ -171,7 +171,10 @@ private struct MessageBubbleRow: View {
 
     private func bubble(background: Color, foreground: Color, alignment: Alignment) -> some View {
         Group {
-            if message.state == .streaming, message.text.isEmpty, message.attachments.isEmpty {
+            if message.state == .streaming,
+               message.text.isEmpty,
+               message.attachments.isEmpty,
+               message.toolCalls.isEmpty {
                 TypingIndicatorView()
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
@@ -180,7 +183,13 @@ private struct MessageBubbleRow: View {
                         MessageAttachmentGridView(attachments: message.attachments)
                     }
 
-                    if message.text.isEmpty == false {
+                    if message.role == .assistant {
+                        StreamingRichMessageView(
+                            text: message.text,
+                            toolCalls: message.toolCalls,
+                            foreground: foreground
+                        )
+                    } else if message.text.isEmpty == false {
                         Text(message.text)
                             .font(.system(size: 18, weight: .semibold))
                             .foregroundStyle(foreground)

@@ -166,6 +166,7 @@ private struct QuickActionsRow: View {
                         )
                     }
                     .buttonStyle(.plain)
+                    .accessibilityIdentifier(action.accessibilityIdentifier)
                 }
             }
             .padding(.horizontal, 2)

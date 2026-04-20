@@ -287,6 +287,7 @@ private struct PersistedChatMessage: Codable {
     let role: String
     let text: String
     let attachments: [PersistedChatImageAttachment]
+    let toolCalls: [ChatToolCall]
     let showsActions: Bool
     let state: String
     let favoritedAt: Date?
@@ -302,6 +303,7 @@ private struct PersistedChatMessage: Codable {
         self.role = message.role == .user ? "user" : "assistant"
         self.text = message.text
         self.attachments = message.attachments.map(PersistedChatImageAttachment.init)
+        self.toolCalls = message.toolCalls
         self.showsActions = message.role == .assistant && trimmedText.isEmpty == false
         self.state = message.state == .failed ? "failed" : "complete"
         self.favoritedAt = message.favoritedAt
@@ -313,6 +315,7 @@ private struct PersistedChatMessage: Codable {
             role: role == "user" ? .user : .assistant,
             text: text,
             attachments: attachments.map(\.attachment),
+            toolCalls: toolCalls,
             showsActions: showsActions,
             state: state == "failed" ? .failed : .complete,
             favoritedAt: favoritedAt

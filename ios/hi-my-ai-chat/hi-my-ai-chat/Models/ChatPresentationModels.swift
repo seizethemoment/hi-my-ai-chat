@@ -42,6 +42,7 @@ struct ChatMessage: Identifiable, Equatable {
     let role: Role
     var text: String
     var attachments: [ChatImageAttachment]
+    var toolCalls: [ChatToolCall]
     var showsActions: Bool
     var state: State
     var favoritedAt: Date?
@@ -55,6 +56,7 @@ struct ChatMessage: Identifiable, Equatable {
         role: Role,
         text: String,
         attachments: [ChatImageAttachment] = [],
+        toolCalls: [ChatToolCall] = [],
         showsActions: Bool,
         state: State = .complete,
         favoritedAt: Date? = nil
@@ -63,6 +65,7 @@ struct ChatMessage: Identifiable, Equatable {
         self.role = role
         self.text = text
         self.attachments = attachments
+        self.toolCalls = toolCalls
         self.showsActions = showsActions
         self.state = state
         self.favoritedAt = favoritedAt
@@ -103,10 +106,60 @@ struct ChatImageAttachment: Identifiable, Equatable, Sendable {
 }
 
 struct QuickAction: Identifiable {
-    let id = UUID()
+    enum Payload {
+        case prompt(String)
+        case scenario(ChatDemoScenario)
+    }
+
+    let id: String
     let title: String
     let systemImage: String
-    let prompt: String
+    let accessibilityIdentifier: String
+    let payload: Payload
+
+    init(
+        id: String,
+        title: String,
+        systemImage: String,
+        prompt: String,
+        accessibilityIdentifier: String
+    ) {
+        self.id = id
+        self.title = title
+        self.systemImage = systemImage
+        self.accessibilityIdentifier = accessibilityIdentifier
+        self.payload = .prompt(prompt)
+    }
+
+    init(
+        id: String,
+        title: String,
+        systemImage: String,
+        scenario: ChatDemoScenario,
+        accessibilityIdentifier: String
+    ) {
+        self.id = id
+        self.title = title
+        self.systemImage = systemImage
+        self.accessibilityIdentifier = accessibilityIdentifier
+        self.payload = .scenario(scenario)
+    }
+
+    var prompt: String? {
+        guard case .prompt(let prompt) = payload else {
+            return nil
+        }
+
+        return prompt
+    }
+
+    var scenario: ChatDemoScenario? {
+        guard case .scenario(let scenario) = payload else {
+            return nil
+        }
+
+        return scenario
+    }
 }
 
 struct AttachmentAction: Identifiable {
