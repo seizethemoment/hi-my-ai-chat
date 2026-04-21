@@ -7,6 +7,7 @@ struct ConversationContextBuilder: Sendable {
         let recentBudget: Int
         let compressionTriggerBudget: Int
         let maxRetainedImageMessages: Int
+        let maxDocumentExcerptCharacters: Int
         let maxSummaryCharacters: Int
         let maxSummaryItems: Int
         let maxSnippetCharacters: Int
@@ -17,6 +18,7 @@ struct ConversationContextBuilder: Sendable {
             recentBudget: 4_800,
             compressionTriggerBudget: 6_500,
             maxRetainedImageMessages: 2,
+            maxDocumentExcerptCharacters: 8_000,
             maxSummaryCharacters: 1_400,
             maxSummaryItems: 12,
             maxSnippetCharacters: 180
@@ -161,13 +163,22 @@ struct ConversationContextBuilder: Sendable {
             components.append("附带 \(message.attachments.count) 张图片")
         }
 
+        if message.documentAttachments.isEmpty == false {
+            let names = message.documentAttachments
+                .prefix(2)
+                .map(\.fileName)
+                .joined(separator: "、")
+            let suffix = message.documentAttachments.count > 2 ? " 等 \(message.documentAttachments.count) 个文件" : ""
+            components.append("附带文档：\(names)\(suffix)")
+        }
+
         return components.joined(separator: "；")
     }
 
     private func makeTurn(from message: ChatMessage) -> OpenAIChatTurn {
         OpenAIChatTurn(
             role: message.role.openAIChatRole,
-            text: message.text,
+            text: composedTurnText(for: message),
             imageDataURLs: message.attachments.map(\.dataURL)
         )
     }
@@ -175,7 +186,52 @@ struct ConversationContextBuilder: Sendable {
     private func estimatedUnits(for message: ChatMessage) -> Int {
         let textUnits = normalizedText(message.text).count
         let imageUnits = message.attachments.count * 1_800
-        return max(textUnits + imageUnits, 1)
+        let documentUnits = documentContextSections(for: message.documentAttachments)
+            .joined(separator: "\n\n")
+            .count
+        return max(textUnits + imageUnits + documentUnits, 1)
+    }
+
+    private func composedTurnText(for message: ChatMessage) -> String {
+        let documentSections = documentContextSections(for: message.documentAttachments)
+        guard documentSections.isEmpty == false else {
+            return message.text
+        }
+
+        let contextBlock = documentSections.joined(separator: "\n\n")
+        let trimmedMessage = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedMessage.isEmpty == false else {
+            return contextBlock
+        }
+
+        return trimmedMessage + "\n\n" + contextBlock
+    }
+
+    private func documentContextSections(for attachments: [ChatDocumentAttachment]) -> [String] {
+        guard attachments.isEmpty == false else { return [] }
+
+        let perDocumentLimit = max(limits.maxDocumentExcerptCharacters / max(attachments.count, 1), 1_500)
+
+        return attachments.map { attachment in
+            var lines = [
+                "[附件文档]",
+                "文件名：\(attachment.fileName)",
+                "类型：\(attachment.kind.contentTypeDescription)"
+            ]
+
+            if let pageCount = attachment.pageCount {
+                lines.append("页数：\(pageCount)")
+            }
+
+            if let content = ChatDocumentStore.loadTextContent(for: attachment, limit: perDocumentLimit),
+               content.isEmpty == false {
+                lines.append("文档内容：\n\(content)")
+            } else {
+                lines.append("文档内容无法直接提取，请结合文件名和上下文理解。")
+            }
+
+            return lines.joined(separator: "\n")
+        }
     }
 
     private func normalizedText(_ text: String) -> String {

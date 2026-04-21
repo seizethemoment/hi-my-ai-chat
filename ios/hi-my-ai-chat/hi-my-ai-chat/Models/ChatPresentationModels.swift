@@ -42,6 +42,7 @@ struct ChatMessage: Identifiable, Equatable {
     let role: Role
     var text: String
     var attachments: [ChatImageAttachment]
+    var documentAttachments: [ChatDocumentAttachment]
     var toolCalls: [ChatToolCall]
     var showsActions: Bool
     var state: State
@@ -56,6 +57,7 @@ struct ChatMessage: Identifiable, Equatable {
         role: Role,
         text: String,
         attachments: [ChatImageAttachment] = [],
+        documentAttachments: [ChatDocumentAttachment] = [],
         toolCalls: [ChatToolCall] = [],
         showsActions: Bool,
         state: State = .complete,
@@ -65,6 +67,7 @@ struct ChatMessage: Identifiable, Equatable {
         self.role = role
         self.text = text
         self.attachments = attachments
+        self.documentAttachments = documentAttachments
         self.toolCalls = toolCalls
         self.showsActions = showsActions
         self.state = state
@@ -166,6 +169,7 @@ struct AttachmentAction: Identifiable {
     enum Source {
         case camera
         case photoLibrary
+        case files
     }
 
     let id = UUID()

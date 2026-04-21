@@ -21,6 +21,10 @@ struct ChatSession: Identifiable, Equatable {
                 return trimmedText
             }
 
+            if let firstDocument = message.documentAttachments.first {
+                return "[文件] \(firstDocument.fileName)"
+            }
+
             if message.attachments.isEmpty == false {
                 return message.attachments.count == 1 ? "[图片]" : "[\(message.attachments.count) 张图片]"
             }
@@ -47,6 +51,10 @@ struct ChatSession: Identifiable, Equatable {
 
         let trimmedText = firstUserMessage.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmedText.isEmpty == false else {
+            if firstUserMessage.documentAttachments.isEmpty == false {
+                return "文档提问"
+            }
+
             return firstUserMessage.attachments.isEmpty ? defaultTitle : "图片提问"
         }
 
@@ -287,6 +295,7 @@ private struct PersistedChatMessage: Codable {
     let role: String
     let text: String
     let attachments: [PersistedChatImageAttachment]
+    let documentAttachments: [ChatDocumentAttachment]
     let toolCalls: [ChatToolCall]
     let showsActions: Bool
     let state: String
@@ -295,7 +304,10 @@ private struct PersistedChatMessage: Codable {
     @MainActor
     init?(message: ChatMessage) {
         let trimmedText = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if message.state == .streaming && trimmedText.isEmpty && message.attachments.isEmpty {
+        if message.state == .streaming,
+           trimmedText.isEmpty,
+           message.attachments.isEmpty,
+           message.documentAttachments.isEmpty {
             return nil
         }
 
@@ -303,6 +315,7 @@ private struct PersistedChatMessage: Codable {
         self.role = message.role == .user ? "user" : "assistant"
         self.text = message.text
         self.attachments = message.attachments.map(PersistedChatImageAttachment.init)
+        self.documentAttachments = message.documentAttachments
         self.toolCalls = message.toolCalls
         self.showsActions = message.role == .assistant && trimmedText.isEmpty == false
         self.state = message.state == .failed ? "failed" : "complete"
@@ -315,6 +328,7 @@ private struct PersistedChatMessage: Codable {
             role: role == "user" ? .user : .assistant,
             text: text,
             attachments: attachments.map(\.attachment),
+            documentAttachments: documentAttachments,
             toolCalls: toolCalls,
             showsActions: showsActions,
             state: state == "failed" ? .failed : .complete,

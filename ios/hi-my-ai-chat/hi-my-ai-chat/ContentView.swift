@@ -7,6 +7,7 @@
 
 import SwiftUI
 import PhotosUI
+import UniformTypeIdentifiers
 import UIKit
 
 struct ContentView: View {
@@ -35,6 +36,9 @@ struct ContentView: View {
     @State private var inputText = ""
     @State private var messages: [ChatMessage] = []
     @State private var pendingImageAttachments: [ChatImageAttachment] = []
+    @State private var pendingDocumentAttachments: [ChatDocumentAttachment] = []
+    @State private var isDocumentPickerPresented = false
+    @State private var selectedDocumentPreview: ChatDocumentAttachment?
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var isRenameSessionAlertPresented = false
     @State private var renameSessionDraft = ""
@@ -122,6 +126,54 @@ struct ContentView: View {
         )
     ]
 
+    private let markdownDocumentQuickActions = [
+        QuickAction(
+            id: "edit_markdown_document",
+            title: "继续编辑文档",
+            systemImage: "square.and.pencil",
+            prompt: "请先阅读我上传的 Markdown 文档，并按我的后续要求继续编辑它。",
+            accessibilityIdentifier: "quick_action_edit_markdown_document"
+        ),
+        QuickAction(
+            id: "summarize_markdown_document",
+            title: "详细总结文档内容",
+            systemImage: "text.alignleft",
+            prompt: "请详细总结这份 Markdown 文档的结构、重点和待完善之处。",
+            accessibilityIdentifier: "quick_action_summarize_markdown_document"
+        ),
+        QuickAction(
+            id: "short_summary_markdown_document",
+            title: "生成简短摘要",
+            systemImage: "arrow.right",
+            prompt: "请为这份 Markdown 文档生成一段简短摘要。",
+            accessibilityIdentifier: "quick_action_short_summary_markdown_document"
+        )
+    ]
+
+    private let pdfDocumentQuickActions = [
+        QuickAction(
+            id: "podcast_pdf_document",
+            title: "听播客",
+            systemImage: "waveform",
+            prompt: "请把这份 PDF 文档改写成适合 5 分钟收听的中文播客讲稿。",
+            accessibilityIdentifier: "quick_action_podcast_pdf_document"
+        ),
+        QuickAction(
+            id: "summarize_pdf_document",
+            title: "详细总结文档内容",
+            systemImage: "text.alignleft",
+            prompt: "请详细总结这份 PDF 文档的核心内容、结构和重点。",
+            accessibilityIdentifier: "quick_action_summarize_pdf_document"
+        ),
+        QuickAction(
+            id: "short_summary_pdf_document",
+            title: "生成简短摘要",
+            systemImage: "arrow.right",
+            prompt: "请为这份 PDF 文档生成一段简短摘要。",
+            accessibilityIdentifier: "quick_action_short_summary_pdf_document"
+        )
+    ]
+
     private let attachmentActions = [
         AttachmentAction(
             title: "相机",
@@ -134,6 +186,12 @@ struct ContentView: View {
             systemImage: "photo.fill.on.rectangle.fill",
             accessibilityIdentifier: "attachment_photo_library_button",
             source: .photoLibrary
+        ),
+        AttachmentAction(
+            title: "文件",
+            systemImage: "doc.fill",
+            accessibilityIdentifier: "attachment_files_button",
+            source: .files
         )
     ]
 
@@ -150,7 +208,7 @@ struct ContentView: View {
     }
 
     private var hasPendingAttachments: Bool {
-        pendingImageAttachments.isEmpty == false
+        pendingImageAttachments.isEmpty == false || pendingDocumentAttachments.isEmpty == false
     }
 
     private var canSend: Bool {
@@ -162,7 +220,16 @@ struct ContentView: View {
     }
 
     private var activeQuickActions: [QuickAction] {
-        hasPendingAttachments ? imageQuickActions : quickActions
+        if let firstDocument = pendingDocumentAttachments.first {
+            switch firstDocument.kind {
+            case .markdown:
+                return markdownDocumentQuickActions
+            case .pdf, .other:
+                return pdfDocumentQuickActions
+            }
+        }
+
+        return pendingImageAttachments.isEmpty == false ? imageQuickActions : quickActions
     }
 
     private var voiceSendMode: VoiceSendMode {
@@ -303,6 +370,19 @@ struct ContentView: View {
                 onDismiss: dismissCamera
             )
         }
+        .fullScreenCover(item: $selectedDocumentPreview) { attachment in
+            ChatDocumentPreviewScreen(
+                attachment: attachment,
+                makeChatService: {
+                    let configuration = OpenAIModelConfiguration(
+                        apiKey: openAIAPIKey,
+                        baseURL: openAIBaseURL,
+                        model: openAIModel
+                    )
+                    return try makeChatService(configuration)
+                }
+            )
+        }
         .photosPicker(
             isPresented: $isPhotoPickerPresented,
             selection: $selectedPhotoItems,
@@ -310,6 +390,13 @@ struct ContentView: View {
             matching: .images,
             photoLibrary: .shared()
         )
+        .fileImporter(
+            isPresented: $isDocumentPickerPresented,
+            allowedContentTypes: [.pdf, UTType(filenameExtension: "md") ?? .plainText],
+            allowsMultipleSelection: true
+        ) { result in
+            handlePickedDocuments(result)
+        }
         .task(id: selectedPhotoItems.count) {
             let items = selectedPhotoItems
             guard items.isEmpty == false else { return }
@@ -399,7 +486,8 @@ struct ContentView: View {
                     onUserCopyTap: handleUserMessageCopy,
                     onAssistantCopyTap: handleAssistantMessageCopy,
                     onAssistantAudioTap: toggleAssistantMessageAudio,
-                    onAssistantFavoriteTap: toggleAssistantMessageFavorite
+                    onAssistantFavoriteTap: toggleAssistantMessageFavorite,
+                    onDocumentTap: openPreview
                 ) {
                     dismissTransientUI()
                 }
@@ -426,12 +514,16 @@ struct ContentView: View {
                         quickActions: activeQuickActions,
                         attachmentActions: attachmentActions,
                         pendingAttachments: pendingImageAttachments,
+                        pendingDocumentAttachments: pendingDocumentAttachments,
                         onQuickActionTap: applyQuickAction,
                         onPrimaryAttachmentTap: presentCamera,
                         onModeButtonTap: handleModeButtonTap,
                         onAttachmentTap: toggleAttachmentDrawer,
                         onAttachmentActionTap: handleAttachmentAction,
                         onRemovePendingAttachment: removePendingAttachment,
+                        onRemovePendingDocument: removePendingDocument,
+                        onPendingDocumentTap: openPreview,
+                        onAddDocumentTap: presentDocumentPicker,
                         onVoicePressBegan: beginVoiceCapture,
                         onVoiceCancelPreviewChanged: handleVoiceCancellationPendingChange,
                         onVoicePressEnded: endVoiceCapture,
@@ -723,6 +815,10 @@ struct ContentView: View {
         sessionStore.updateMessages(updatedMessages, for: currentSessionID)
     }
 
+    private func openPreview(_ attachment: ChatDocumentAttachment) {
+        selectedDocumentPreview = attachment
+    }
+
     private func loadSession(_ session: ChatSession) {
         voiceInputController.cancelCapture()
         voicePlaybackController.stop()
@@ -733,6 +829,8 @@ struct ContentView: View {
         messages = sessionMessages
         inputText = ""
         pendingImageAttachments = []
+        pendingDocumentAttachments = []
+        selectedDocumentPreview = nil
         selectedPhotoItems = []
         isVoiceCancellationPending = false
         toastMessage = nil
@@ -741,6 +839,7 @@ struct ContentView: View {
         isRenameSessionAlertPresented = false
         isAttachmentDrawerPresented = false
         isPhotoPickerPresented = false
+        isDocumentPickerPresented = false
         isCameraPresented = false
         isTextFieldFocused = false
         prefersTextInput = false
@@ -974,6 +1073,8 @@ struct ContentView: View {
             presentCamera()
         case .photoLibrary:
             presentPhotoLibrary()
+        case .files:
+            presentDocumentPicker()
         }
     }
 
@@ -996,6 +1097,14 @@ struct ContentView: View {
         isTextFieldFocused = false
         dismissKeyboard()
         isCameraPresented = true
+    }
+
+    private func presentDocumentPicker() {
+        voiceInputController.cancelCapture()
+        isAttachmentDrawerPresented = false
+        isTextFieldFocused = false
+        dismissKeyboard()
+        isDocumentPickerPresented = true
     }
 
     private func dismissCamera() {
@@ -1040,17 +1149,68 @@ struct ContentView: View {
         focusComposerTextField()
     }
 
+    private func handlePickedDocuments(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            guard urls.isEmpty == false else { return }
+
+            Task {
+                do {
+                    let importedDocuments = try ChatDocumentStore.importPickedFiles(from: urls)
+                    await MainActor.run {
+                        let existingIDs = Set(pendingDocumentAttachments.map(\.id))
+                        let remainingSlots = max(4 - pendingDocumentAttachments.count, 0)
+                        let deduplicated = importedDocuments.filter { existingIDs.contains($0.id) == false }
+                        let appended = Array(deduplicated.prefix(remainingSlots))
+
+                        pendingDocumentAttachments.append(contentsOf: appended)
+                        prefersTextInput = true
+                        isAttachmentDrawerPresented = false
+                        if appended.isEmpty == false {
+                            focusComposerTextField()
+                        }
+                        if importedDocuments.count > appended.count {
+                            presentToast("最多同时添加 4 个文件")
+                        }
+                    }
+                } catch {
+                    await MainActor.run {
+                        mediaAlertMessage = error.localizedDescription
+                    }
+                }
+            }
+        case .failure(let error):
+            let nsError = error as NSError
+            guard nsError.code != NSUserCancelledError else { return }
+            mediaAlertMessage = error.localizedDescription
+        }
+    }
+
     private func removePendingAttachment(_ attachmentID: UUID) {
         pendingImageAttachments.removeAll { $0.id == attachmentID }
 
-        if pendingImageAttachments.isEmpty, inputText.isEmpty {
+        if pendingImageAttachments.isEmpty,
+           pendingDocumentAttachments.isEmpty,
+           inputText.isEmpty {
+            prefersTextInput = false
+        }
+    }
+
+    private func removePendingDocument(_ attachmentID: UUID) {
+        pendingDocumentAttachments.removeAll { $0.id == attachmentID }
+
+        if pendingImageAttachments.isEmpty,
+           pendingDocumentAttachments.isEmpty,
+           inputText.isEmpty {
             prefersTextInput = false
         }
     }
 
     private func handleModeButtonTap() {
         if isTextMode {
-            if inputText.isEmpty, pendingImageAttachments.isEmpty {
+            if inputText.isEmpty,
+               pendingImageAttachments.isEmpty,
+               pendingDocumentAttachments.isEmpty {
                 prefersTextInput = false
                 dismissTransientUI()
             } else {
@@ -1124,7 +1284,9 @@ struct ContentView: View {
         isVoiceCancellationPending = false
         isAttachmentDrawerPresented = false
         isTextFieldFocused = false
-        if inputText.isEmpty, pendingImageAttachments.isEmpty {
+        if inputText.isEmpty,
+           pendingImageAttachments.isEmpty,
+           pendingDocumentAttachments.isEmpty {
             prefersTextInput = false
         }
         dismissKeyboard()
@@ -1140,12 +1302,14 @@ struct ContentView: View {
     private func handleSend() {
         guard canSend, let currentSessionID else { return }
 
-        let prompt = trimmedInput
+        let prompt = resolvedPromptForSend()
         let attachments = pendingImageAttachments
+        let documentAttachments = pendingDocumentAttachments
         let newUserMessage = ChatMessage(
             role: .user,
             text: prompt,
             attachments: attachments,
+            documentAttachments: documentAttachments,
             showsActions: false
         )
         let assistantMessageID = UUID()
@@ -1163,6 +1327,23 @@ struct ContentView: View {
                 sessionID: currentSessionID
             )
         }
+    }
+
+    private func resolvedPromptForSend() -> String {
+        guard trimmedInput.isEmpty else { return trimmedInput }
+
+        if let firstDocument = pendingDocumentAttachments.first {
+            switch firstDocument.kind {
+            case .markdown:
+                return "请先阅读我上传的 Markdown 文档，并告诉我可以如何继续编辑它。"
+            case .pdf:
+                return "请先阅读我上传的 PDF 文档，并概括核心内容。"
+            case .other:
+                return "请先阅读我上传的文件，并告诉我可以如何处理它。"
+            }
+        }
+
+        return trimmedInput
     }
 
     private func runDemoScenario(_ scenario: ChatDemoScenario) {
@@ -1213,6 +1394,7 @@ struct ContentView: View {
 
         inputText = ""
         pendingImageAttachments = []
+        pendingDocumentAttachments = []
         isAttachmentDrawerPresented = false
         voiceInputController.cancelCapture()
         voicePlaybackController.stop()

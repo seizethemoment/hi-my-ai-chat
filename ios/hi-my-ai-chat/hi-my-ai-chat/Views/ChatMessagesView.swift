@@ -10,6 +10,7 @@ struct ChatMessagesView: View {
     let onAssistantCopyTap: (ChatMessage) -> Void
     let onAssistantAudioTap: (ChatMessage) -> Void
     let onAssistantFavoriteTap: (ChatMessage) -> Void
+    let onDocumentTap: (ChatDocumentAttachment) -> Void
     let onBackgroundTap: () -> Void
 
     var body: some View {
@@ -31,7 +32,8 @@ struct ChatMessagesView: View {
                                     onUserCopyTap: onUserCopyTap,
                                     onAssistantCopyTap: onAssistantCopyTap,
                                     onAssistantAudioTap: onAssistantAudioTap,
-                                    onAssistantFavoriteTap: onAssistantFavoriteTap
+                                    onAssistantFavoriteTap: onAssistantFavoriteTap,
+                                    onDocumentTap: onDocumentTap
                                 )
                                 .transition(.move(edge: .bottom).combined(with: .opacity))
                             }
@@ -96,6 +98,7 @@ private struct MessageBubbleRow: View {
     let onAssistantCopyTap: (ChatMessage) -> Void
     let onAssistantAudioTap: (ChatMessage) -> Void
     let onAssistantFavoriteTap: (ChatMessage) -> Void
+    let onDocumentTap: (ChatDocumentAttachment) -> Void
 
     var body: some View {
         HStack {
@@ -174,11 +177,19 @@ private struct MessageBubbleRow: View {
             if message.state == .streaming,
                message.text.isEmpty,
                message.attachments.isEmpty,
+               message.documentAttachments.isEmpty,
                message.toolCalls.isEmpty {
                 TypingIndicatorView()
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                VStack(alignment: .leading, spacing: message.text.isEmpty || message.attachments.isEmpty ? 0 : 10) {
+                VStack(alignment: .leading, spacing: 10) {
+                    if message.documentAttachments.isEmpty == false {
+                        MessageDocumentAttachmentListView(
+                            attachments: message.documentAttachments,
+                            onTap: onDocumentTap
+                        )
+                    }
+
                     if message.attachments.isEmpty == false {
                         MessageAttachmentGridView(attachments: message.attachments)
                     }
@@ -195,6 +206,8 @@ private struct MessageBubbleRow: View {
                             .foregroundStyle(foreground)
                             .multilineTextAlignment(.leading)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                    } else if message.text.isEmpty {
+                        EmptyView()
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -208,6 +221,23 @@ private struct MessageBubbleRow: View {
                 .fill(background)
         )
         .frame(maxWidth: .infinity, alignment: alignment)
+    }
+}
+
+private struct MessageDocumentAttachmentListView: View {
+    let attachments: [ChatDocumentAttachment]
+    let onTap: (ChatDocumentAttachment) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(attachments) { attachment in
+                ChatDocumentCardView(
+                    attachment: attachment,
+                    minHeight: 96,
+                    tapAction: { onTap(attachment) }
+                )
+            }
+        }
     }
 }
 

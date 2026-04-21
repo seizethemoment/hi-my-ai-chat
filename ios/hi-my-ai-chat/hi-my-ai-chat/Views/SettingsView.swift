@@ -656,6 +656,7 @@ private struct SettingsInputField: View {
             }
             .font(.system(size: 16, weight: .medium))
             .foregroundStyle(Color.black.opacity(0.84))
+            .tint(Color.black.opacity(0.84))
             .textInputAutocapitalization(.never)
             .autocorrectionDisabled()
             .keyboardType(keyboardType)
@@ -697,6 +698,9 @@ private struct SettingsAPIKeyField: View {
             Group {
                 if isEditing {
                     TextField(placeholder, text: $text)
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(Color.black.opacity(0.84))
+                        .tint(Color.black.opacity(0.84))
                         .focused($isFocused)
                         .submitLabel(.done)
                         .onSubmit(endEditing)

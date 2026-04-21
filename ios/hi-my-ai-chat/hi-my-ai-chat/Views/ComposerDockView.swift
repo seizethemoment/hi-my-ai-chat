@@ -11,12 +11,16 @@ struct ComposerDockView: View {
     let quickActions: [QuickAction]
     let attachmentActions: [AttachmentAction]
     let pendingAttachments: [ChatImageAttachment]
+    let pendingDocumentAttachments: [ChatDocumentAttachment]
     let onQuickActionTap: (QuickAction) -> Void
     let onPrimaryAttachmentTap: () -> Void
     let onModeButtonTap: () -> Void
     let onAttachmentTap: () -> Void
     let onAttachmentActionTap: (AttachmentAction) -> Void
     let onRemovePendingAttachment: (UUID) -> Void
+    let onRemovePendingDocument: (UUID) -> Void
+    let onPendingDocumentTap: (ChatDocumentAttachment) -> Void
+    let onAddDocumentTap: () -> Void
     let onVoicePressBegan: () -> Void
     let onVoiceCancelPreviewChanged: (Bool) -> Void
     let onVoicePressEnded: (Bool) -> Void
@@ -24,8 +28,19 @@ struct ComposerDockView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            QuickActionsRow(actions: quickActions, onTap: onQuickActionTap)
-                .accessibilityIdentifier("quick_action_scroll")
+            if pendingDocumentAttachments.isEmpty {
+                QuickActionsRow(actions: quickActions, onTap: onQuickActionTap)
+                    .accessibilityIdentifier("quick_action_scroll")
+            } else {
+                PendingDocumentComposerBoardView(
+                    attachments: pendingDocumentAttachments,
+                    quickActions: quickActions,
+                    onQuickActionTap: onQuickActionTap,
+                    onRemove: onRemovePendingDocument,
+                    onOpen: onPendingDocumentTap,
+                    onAdd: onAddDocumentTap
+                )
+            }
 
             if pendingAttachments.isEmpty == false {
                 PendingAttachmentStripView(
@@ -58,7 +73,7 @@ struct ComposerDockView: View {
 
             Group {
                 if isTextMode {
-                    TextField("发消息...", text: $text, axis: .vertical)
+                    TextField("输入问题或直接发送…", text: $text, axis: .vertical)
                         .font(.system(size: 18, weight: .medium))
                         .foregroundStyle(Color.black.opacity(0.86))
                         .lineLimit(1...3)
@@ -132,6 +147,60 @@ struct ComposerDockView: View {
                 )
         )
         .shadow(color: Color.black.opacity(0.08), radius: 16, x: 0, y: 8)
+    }
+}
+
+private struct PendingDocumentComposerBoardView: View {
+    let attachments: [ChatDocumentAttachment]
+    let quickActions: [QuickAction]
+    let onQuickActionTap: (QuickAction) -> Void
+    let onRemove: (UUID) -> Void
+    let onOpen: (ChatDocumentAttachment) -> Void
+    let onAdd: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 12) {
+                    ForEach(attachments) { attachment in
+                        ChatDocumentCardView(
+                            attachment: attachment,
+                            width: 188,
+                            minHeight: 118,
+                            removeAction: { onRemove(attachment.id) },
+                            tapAction: { onOpen(attachment) }
+                        )
+                    }
+
+                    Button(action: onAdd) {
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(Color.black.opacity(0.04))
+                            .overlay(
+                                Image(systemName: "plus")
+                                    .font(.system(size: 30, weight: .medium))
+                                    .foregroundStyle(Color.black.opacity(0.36))
+                            )
+                            .frame(width: 116, height: 118)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("pending_document_add_button")
+                }
+                .padding(.horizontal, 2)
+            }
+
+            QuickActionsRow(actions: quickActions, onTap: onQuickActionTap)
+                .accessibilityIdentifier("quick_action_scroll")
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color.white)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .stroke(Color.black.opacity(0.05), lineWidth: 1)
+                )
+        )
+        .shadow(color: Color.black.opacity(0.05), radius: 14, x: 0, y: 6)
     }
 }
 
