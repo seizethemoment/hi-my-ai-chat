@@ -12,62 +12,101 @@ struct ChatMessagesView: View {
     let onAssistantFavoriteTap: (ChatMessage) -> Void
     let onDocumentTap: (ChatDocumentAttachment) -> Void
     let onBackgroundTap: () -> Void
+    @State private var bottomAnchorMaxY: CGFloat = 0
 
     var body: some View {
         GeometryReader { proxy in
             ScrollViewReader { scrollProxy in
-                ScrollView(showsIndicators: false) {
-                    LazyVStack(spacing: 16) {
-                        if messages.isEmpty {
-                            Color.clear
-                                .frame(height: 1)
-                                .id("chat_empty_anchor")
-                        } else {
-                            ForEach(messages) { message in
-                                MessageBubbleRow(
-                                    message: message,
-                                    canDelete: canDeleteMessages,
-                                    playingMessageID: playingMessageID,
-                                    onDelete: onDeleteMessage,
-                                    onUserCopyTap: onUserCopyTap,
-                                    onAssistantCopyTap: onAssistantCopyTap,
-                                    onAssistantAudioTap: onAssistantAudioTap,
-                                    onAssistantFavoriteTap: onAssistantFavoriteTap,
-                                    onDocumentTap: onDocumentTap
-                                )
-                                .transition(.move(edge: .bottom).combined(with: .opacity))
-                            }
+                ZStack(alignment: .bottom) {
+                    ScrollView(showsIndicators: false) {
+                        LazyVStack(spacing: 16) {
+                            if messages.isEmpty {
+                                Color.clear
+                                    .frame(height: 1)
+                                    .id("chat_empty_anchor")
+                            } else {
+                                ForEach(messages) { message in
+                                    MessageBubbleRow(
+                                        message: message,
+                                        canDelete: canDeleteMessages,
+                                        playingMessageID: playingMessageID,
+                                        onDelete: onDeleteMessage,
+                                        onUserCopyTap: onUserCopyTap,
+                                        onAssistantCopyTap: onAssistantCopyTap,
+                                        onAssistantAudioTap: onAssistantAudioTap,
+                                        onAssistantFavoriteTap: onAssistantFavoriteTap,
+                                        onDocumentTap: onDocumentTap
+                                    )
+                                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                                }
 
-                            Color.clear
-                                .frame(height: 1)
-                                .id("chat_bottom_anchor")
+                                Color.clear
+                                    .frame(height: 1)
+                                    .id("chat_bottom_anchor")
+                                    .background(
+                                        GeometryReader { anchorProxy in
+                                            Color.clear.preference(
+                                                key: ChatBottomAnchorMaxYPreferenceKey.self,
+                                                value: anchorProxy.frame(in: .named("chat_messages_scroll_space")).maxY
+                                            )
+                                        }
+                                    )
+                            }
                         }
+                        .frame(maxWidth: .infinity, alignment: .top)
+                        .frame(minHeight: max(proxy.size.height - 24, 0), alignment: .top)
+                        .padding(.top, 12)
+                        .padding(.bottom, 12)
                     }
-                    .frame(maxWidth: .infinity, alignment: .top)
-                    .frame(minHeight: max(proxy.size.height - 24, 0), alignment: .top)
-                    .padding(.top, 12)
-                    .padding(.bottom, 12)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                .clipped()
-                .contentShape(Rectangle())
-                .onTapGesture(perform: onBackgroundTap)
-                .accessibilityIdentifier("chat_messages_scroll")
-                .onChange(of: scrollToBottomRequest, initial: false) { _, _ in
-                    scheduleScrollToBottom(using: scrollProxy, animated: true)
-                }
-                .onChange(of: messages.last?.id, initial: true) { _, _ in
-                    scheduleScrollToBottom(using: scrollProxy, animated: true)
-                }
-                .onChange(of: messages.last?.text ?? "", initial: false) { _, _ in
-                    scrollToBottom(using: scrollProxy, animated: false)
+                    .coordinateSpace(name: "chat_messages_scroll_space")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .clipped()
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: onBackgroundTap)
+                    .accessibilityIdentifier("chat_messages_scroll")
+                    .onChange(of: scrollToBottomRequest, initial: false) { _, _ in
+                        scheduleScrollToBottom(using: scrollProxy, animated: true)
+                    }
+                    .onChange(of: messages.last?.id, initial: true) { _, _ in
+                        scheduleScrollToBottom(using: scrollProxy, animated: true)
+                    }
+                    .onChange(of: messages.last?.text ?? "", initial: false) { _, _ in
+                        scrollToBottom(using: scrollProxy, animated: false)
+                    }
+                    .onPreferenceChange(ChatBottomAnchorMaxYPreferenceKey.self) { value in
+                        bottomAnchorMaxY = value
+                    }
+
+                    if showsScrollToBottomButton(in: proxy.size.height) {
+                        Button {
+                            scrollToBottom(using: scrollProxy, animated: true)
+                        } label: {
+                            Image(systemName: "arrow.down")
+                                .font(.system(size: 24, weight: .bold))
+                                .foregroundStyle(Color.black.opacity(0.92))
+                                .frame(width: 66, height: 66)
+                                .background(
+                                    Circle()
+                                        .fill(Color.white.opacity(0.96))
+                                )
+                                .overlay(
+                                    Circle()
+                                        .stroke(Color.black.opacity(0.06), lineWidth: 1)
+                                )
+                                .shadow(color: Color.black.opacity(0.12), radius: 18, x: 0, y: 10)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.bottom, 24)
+                        .accessibilityLabel("滚动到底部")
+                        .accessibilityIdentifier("chat_scroll_to_bottom_button")
+                    }
                 }
             }
         }
     }
 
     private func scheduleScrollToBottom(using scrollProxy: ScrollViewProxy, animated: Bool) {
-        DispatchQueue.main.async {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             scrollToBottom(using: scrollProxy, animated: animated)
         }
     }
@@ -86,6 +125,20 @@ struct ChatMessagesView: View {
         } else {
             action()
         }
+    }
+
+    private func showsScrollToBottomButton(in scrollViewHeight: CGFloat) -> Bool {
+        guard messages.isEmpty == false else { return false }
+        let threshold: CGFloat = 44
+        return bottomAnchorMaxY - scrollViewHeight > threshold
+    }
+}
+
+private struct ChatBottomAnchorMaxYPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 

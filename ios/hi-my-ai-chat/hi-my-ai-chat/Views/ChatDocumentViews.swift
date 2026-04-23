@@ -1016,6 +1016,7 @@ private struct MarkdownDocumentEditorScreen: View {
 
     private func beginMarkdownVoiceCapture() {
         guard isEditing, isApplyingAI == false else { return }
+        dismissKeyboard()
         isVoiceCancellationPending = false
         statusMessage = "请说出要如何修改这份 Markdown"
         voiceInputController.beginCapture()
@@ -1024,6 +1025,10 @@ private struct MarkdownDocumentEditorScreen: View {
             title: "语音输入开始",
             detail: "开始录制语音指令。"
         )
+    }
+
+    private func dismissKeyboard() {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
 
     private func handleMarkdownVoiceCancellationPendingChange(_ isPending: Bool) {
