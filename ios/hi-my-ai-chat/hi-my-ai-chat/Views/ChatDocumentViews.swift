@@ -285,6 +285,10 @@ private struct MarkdownDocumentEditorScreen: View {
     let makeChatService: () throws -> any ChatServiceProtocol
 
     @Environment(\.dismiss) private var dismiss
+    @StateObject private var voiceInputController = VoiceInputController()
+    @AppStorage("voice_auto_send_enabled") private var isVoiceAutoSendEnabled = true
+    @AppStorage("markdown_agent_floating_bubble_x") private var floatingBubbleNormalizedX = 0.92
+    @AppStorage("markdown_agent_floating_bubble_y") private var floatingBubbleNormalizedY = 0.82
     @State private var draft = ""
     @State private var savedDraft = ""
     @State private var aiInstruction = ""
@@ -293,6 +297,18 @@ private struct MarkdownDocumentEditorScreen: View {
     @State private var errorMessage: String?
     @State private var statusMessage: String?
     @State private var isShareSheetPresented = false
+    @State private var isAIDockExpanded = false
+    @State private var agentScopeMode: MarkdownAgentScopeMode = .fullDocument
+    @State private var lineRangeInput = ""
+    @State private var selectionSnapshot = MarkdownEditorSelectionSnapshot.empty
+    @State private var pendingProposal: MarkdownAgentPendingProposal?
+    @State private var activityEntries: [MarkdownAgentActivityEntry] = []
+    @State private var isActivityLogPresented = false
+    @State private var canRollbackRevision = false
+    @State private var redoSnapshots: [MarkdownAgentRevisionSnapshot] = []
+    @State private var floatingBubbleDragOffset: CGSize = .zero
+    @State private var isVoiceCancellationPending = false
+    @State private var suppressRedoInvalidation = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -311,7 +327,12 @@ private struct MarkdownDocumentEditorScreen: View {
                                     .stroke(Color.black.opacity(0.08), lineWidth: 1)
                             )
 
-                        MarkdownSyntaxTextEditor(text: $draft)
+                        MarkdownSyntaxTextEditor(
+                            text: $draft,
+                            selectionSnapshot: $selectionSnapshot,
+                            extraBottomInset: editorBottomInset
+                        )
+                            .allowsHitTesting(isApplyingAI == false)
                             .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
                             .accessibilityIdentifier("markdown_document_text_editor")
 
@@ -345,12 +366,22 @@ private struct MarkdownDocumentEditorScreen: View {
         .background(Color.white)
         .ignoresSafeArea(edges: .bottom)
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            if isEditing {
+            if isEditing, isAIDockExpanded {
                 MarkdownEditorAIDockView(
                     instruction: $aiInstruction,
+                    isExpanded: $isAIDockExpanded,
+                    scopeMode: $agentScopeMode,
+                    lineRangeInput: $lineRangeInput,
+                    selectionSnapshot: selectionSnapshot,
+                    totalLineCount: totalLineCount,
                     canApplyAI: canApplyAI,
                     isApplyingAI: isApplyingAI,
                     statusMessage: statusMessage,
+                    isVoiceCapturing: voiceInputController.state != .idle,
+                    isVoiceCaptureEnabled: isApplyingAI == false,
+                    onVoicePressBegan: beginMarkdownVoiceCapture,
+                    onVoiceCancelPreviewChanged: handleMarkdownVoiceCancellationPendingChange,
+                    onVoicePressEnded: endMarkdownVoiceCapture,
                     onApply: applyAIEdit
                 )
             } else if let statusMessage {
@@ -360,19 +391,117 @@ private struct MarkdownDocumentEditorScreen: View {
                     .padding(.horizontal, 18)
                     .padding(.vertical, 12)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.white)
+                .background(Color.white)
+            }
+        }
+        .overlay {
+            if isEditing, isAIDockExpanded == false {
+                GeometryReader { proxy in
+                    let bubbleCenter = resolvedFloatingBubbleCenter(in: proxy.size)
+
+                    MarkdownFloatingAssistantBubble(
+                        showsIndicator: floatingBubbleShowsIndicator,
+                        accessibilityValue: floatingBubbleAccessibilityValue
+                    )
+                    .position(bubbleCenter)
+                    .gesture(
+                        DragGesture(minimumDistance: 1)
+                            .onChanged { value in
+                                floatingBubbleDragOffset = value.translation
+                            }
+                            .onEnded { value in
+                                let baseCenter = persistedFloatingBubbleCenter(in: proxy.size)
+                                let targetCenter = CGPoint(
+                                    x: baseCenter.x + value.translation.width,
+                                    y: baseCenter.y + value.translation.height
+                                )
+                                persistFloatingBubbleCenter(targetCenter, in: proxy.size)
+                                floatingBubbleDragOffset = .zero
+                            }
+                    )
+                    .onTapGesture {
+                        floatingBubbleDragOffset = .zero
+                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                            isAIDockExpanded = true
+                        }
+                    }
+
+                }
+                .transition(.opacity)
+            }
+        }
+        .overlay {
+            if voiceInputController.state.showsOverlay {
+                RecordingOverlayView(
+                    state: voiceInputController.state,
+                    transcript: voiceInputController.transcript,
+                    sendMode: voiceSendMode,
+                    isCancellationPending: isVoiceCancellationPending
+                )
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+                .zIndex(3)
             }
         }
         .task {
             if draft.isEmpty {
                 loadDraft()
             }
+            updateRevisionAvailability()
+        }
+        .onChange(of: voiceInputController.finalTranscript) { _, transcript in
+            guard let transcript else { return }
+            applyVoiceTranscript(transcript)
+            voiceInputController.consumeFinalTranscript()
+        }
+        .onChange(of: voiceInputController.lastErrorMessage) { _, errorMessage in
+            guard let errorMessage else { return }
+            self.errorMessage = errorMessage
+            appendActivityLog(
+                kind: .failure,
+                title: "语音输入失败",
+                detail: errorMessage
+            )
+            voiceInputController.consumeLastErrorMessage()
+        }
+        .onChange(of: voiceInputController.toastMessage) { _, message in
+            guard let message else { return }
+            statusMessage = message
+            appendActivityLog(
+                kind: .warning,
+                title: "语音输入提示",
+                detail: message
+            )
+            voiceInputController.consumeToastMessage()
+        }
+        .onChange(of: isEditing) { _, isEditing in
+            guard isEditing == false else { return }
+            cancelMarkdownVoiceCapture()
+        }
+        .onChange(of: draft) { oldValue, newValue in
+            guard oldValue != newValue else { return }
+            guard suppressRedoInvalidation == false else { return }
+            if redoSnapshots.isEmpty == false {
+                redoSnapshots.removeAll()
+            }
+        }
+        .onDisappear {
+            cancelMarkdownVoiceCapture()
         }
         .sheet(isPresented: $isShareSheetPresented) {
             ShareSheetView(activityItems: [attachment.resolvedURL])
         }
+        .sheet(item: $pendingProposal) { proposal in
+            MarkdownAgentProposalSheetView(
+                pendingProposal: proposal,
+                onApply: confirmPendingProposal,
+                onDiscard: discardPendingProposal
+            )
+        }
+        .sheet(isPresented: $isActivityLogPresented) {
+            MarkdownAgentActivityLogSheetView(entries: activityEntries)
+        }
         .alert(
-            "文档不可用",
+            "操作不可用",
             isPresented: Binding(
                 get: { errorMessage != nil },
                 set: { isPresented in
@@ -398,8 +527,62 @@ private struct MarkdownDocumentEditorScreen: View {
         aiInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private var voiceSendMode: VoiceSendMode {
+        isVoiceAutoSendEnabled ? .auto : .manual
+    }
+
+    private var canRedoRevision: Bool {
+        redoSnapshots.isEmpty == false
+    }
+
     private var canApplyAI: Bool {
-        isApplyingAI == false && trimmedDraft.isEmpty == false && trimmedInstruction.isEmpty == false
+        canApplyAI(for: aiInstruction)
+    }
+
+    private func canApplyAI(for instruction: String) -> Bool {
+        guard isApplyingAI == false,
+              trimmedDraft.isEmpty == false,
+              instruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
+            return false
+        }
+
+        switch agentScopeMode {
+        case .fullDocument:
+            return true
+        case .selection:
+            return selectionSnapshot.hasSelection
+        case .lineRange:
+            return (try? MarkdownLineLocator.parseLineRange(from: lineRangeInput, maxLine: totalLineCount)) != nil
+        }
+    }
+
+    private var editorBottomInset: CGFloat {
+        isAIDockExpanded ? 168 : 28
+    }
+
+    private var totalLineCount: Int {
+        MarkdownLineLocator.lineCount(in: draft)
+    }
+
+    private var floatingBubbleShowsIndicator: Bool {
+        if let statusMessage, statusMessage.isEmpty == false {
+            return true
+        }
+
+        return aiInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    private var floatingBubbleAccessibilityValue: String {
+        if let statusMessage, statusMessage.isEmpty == false {
+            return statusMessage
+        }
+
+        let trimmedInstruction = aiInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedInstruction.isEmpty == false {
+            return "\(agentScopeMode.title)模式已就绪"
+        }
+
+        return "拖拽或点击展开 AI 修改文档"
     }
 
     private var topBar: some View {
@@ -426,14 +609,16 @@ private struct MarkdownDocumentEditorScreen: View {
 
             Spacer(minLength: 8)
 
-            Button(action: { isShareSheetPresented = true }) {
-                Image(systemName: "arrowshape.turn.up.right")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(Color.black.opacity(0.84))
-                    .frame(width: 40, height: 40)
+            if isEditing == false {
+                Button(action: { isShareSheetPresented = true }) {
+                    Image(systemName: "arrowshape.turn.up.right")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(Color.black.opacity(0.84))
+                        .frame(width: 40, height: 40)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("markdown_document_share_button")
             }
-            .buttonStyle(.plain)
-            .accessibilityIdentifier("markdown_document_share_button")
 
             Button(action: { isEditing.toggle() }) {
                 Text(isEditing ? "预览" : "编辑")
@@ -450,6 +635,39 @@ private struct MarkdownDocumentEditorScreen: View {
             .accessibilityIdentifier("markdown_document_toggle_button")
 
             if isEditing {
+                Button(action: { isActivityLogPresented = true }) {
+                    Image(systemName: "list.bullet.rectangle.portrait")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(Color.black.opacity(0.78))
+                        .frame(width: 40, height: 40)
+                }
+                .buttonStyle(.plain)
+                .disabled(activityEntries.isEmpty)
+                .opacity(activityEntries.isEmpty ? 0.35 : 1)
+                .accessibilityIdentifier("markdown_document_log_button")
+
+                Button(action: rollbackLastRevision) {
+                    Image(systemName: "arrow.uturn.backward.circle")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(Color.black.opacity(0.78))
+                        .frame(width: 40, height: 40)
+                }
+                .buttonStyle(.plain)
+                .disabled(canRollbackRevision == false || isApplyingAI)
+                .opacity(canRollbackRevision && isApplyingAI == false ? 1 : 0.35)
+                .accessibilityIdentifier("markdown_document_rollback_button")
+
+                Button(action: redoLastRevision) {
+                    Image(systemName: "arrow.uturn.forward.circle")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(Color.black.opacity(0.78))
+                        .frame(width: 40, height: 40)
+                }
+                .buttonStyle(.plain)
+                .disabled(canRedoRevision == false || isApplyingAI)
+                .opacity(canRedoRevision && isApplyingAI == false ? 1 : 0.35)
+                .accessibilityIdentifier("markdown_document_redo_button")
+
                 Button(action: saveDraft) {
                     Text("保存")
                         .font(.system(size: 14, weight: .bold))
@@ -476,11 +694,23 @@ private struct MarkdownDocumentEditorScreen: View {
     private func loadDraft() {
         guard let content = ChatDocumentStore.loadTextContent(for: attachment) else {
             errorMessage = "读取 Markdown 文件失败。"
+            appendActivityLog(
+                kind: .failure,
+                title: "读取失败",
+                detail: "无法从本地载入 Markdown 文件内容。"
+            )
             return
         }
 
         draft = content
         savedDraft = content
+        selectionSnapshot = .empty
+        redoSnapshots.removeAll()
+        appendActivityLog(
+            kind: .info,
+            title: "文档已加载",
+            detail: "已载入 \(MarkdownLineLocator.lineCount(in: content)) 行 Markdown 内容。"
+        )
     }
 
     private func saveDraft() {
@@ -488,12 +718,23 @@ private struct MarkdownDocumentEditorScreen: View {
             try ChatDocumentStore.updateMarkdownFile(for: attachment, content: draft)
             savedDraft = draft
             statusMessage = "已保存修改"
+            appendActivityLog(
+                kind: .success,
+                title: "手动保存",
+                detail: "已将当前编辑内容写回到本地 Markdown 文件。"
+            )
         } catch {
             errorMessage = error.localizedDescription
+            appendActivityLog(
+                kind: .failure,
+                title: "保存失败",
+                detail: error.localizedDescription
+            )
         }
     }
 
     private func dismissWithAutoSave() {
+        cancelMarkdownVoiceCapture()
         if draft != savedDraft {
             saveDraft()
         }
@@ -507,105 +748,482 @@ private struct MarkdownDocumentEditorScreen: View {
         let sourceDraft = draft
         guard sourceDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
             statusMessage = nil
-            errorMessage = "Markdown 文档内容为空，无法发送给模型。"
+            errorMessage = MarkdownAgentError.emptyDocument.localizedDescription
             return
         }
 
-        aiInstruction = ""
+        cancelMarkdownVoiceCapture()
+        isAIDockExpanded = true
         isApplyingAI = true
-        statusMessage = "模型正在修改文档…"
+        statusMessage = "Markdown agent 正在生成修改提案…"
 
         Task {
             do {
-                let service = try makeChatService()
-                var streamedReply = ""
-                let finalReply = try await service.streamReply(
-                    for: markdownEditTurns(
-                        fileName: attachment.fileName,
-                        content: sourceDraft,
-                        instruction: instruction
-                    ),
-                    timeoutInterval: 90,
-                    maxRetryCount: 0,
-                    onRetry: nil,
-                    onEvent: { event in
-                        guard case .textDelta(let delta) = event else { return }
-                        streamedReply += delta
-                        await MainActor.run {
-                            draft = streamedReply
-                        }
-                    }
+                let scope = try resolvedEditScope(for: sourceDraft)
+                await MainActor.run {
+                    appendActivityLog(
+                        kind: .info,
+                        title: "提案开始",
+                        detail: "范围：\(scope.label)；指令：\(instruction)"
+                    )
+                }
+
+                let service = try MarkdownDocumentAgentService()
+                let proposal = try await service.proposeEdit(
+                    fileName: attachment.fileName,
+                    content: sourceDraft,
+                    instruction: instruction,
+                    scope: scope,
+                    timeoutInterval: 90
+                )
+                let diff = MarkdownDiffEngine.makeDiff(
+                    original: sourceDraft,
+                    updated: proposal.updatedMarkdown
                 )
 
-                await MainActor.run {
-                    let normalizedReply = finalReply.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard normalizedReply.isEmpty == false else {
-                        draft = sourceDraft
-                        isApplyingAI = false
-                        statusMessage = nil
-                        errorMessage = MarkdownEditorAIError.emptyResponse.localizedDescription
-                        return
-                    }
+                guard diff.hasChanges else {
+                    throw MarkdownAgentError.unchangedProposal
+                }
 
-                    draft = normalizedReply
+                await MainActor.run {
+                    pendingProposal = MarkdownAgentPendingProposal(
+                        instruction: instruction,
+                        scope: scope,
+                        originalMarkdown: sourceDraft,
+                        proposal: proposal,
+                        diff: diff
+                    )
+                    aiInstruction = ""
                     isApplyingAI = false
-                    saveDraft()
-                    statusMessage = "已应用 AI 修改"
+                    statusMessage = "提案已生成，请确认后写回"
+                    appendActivityLog(
+                        kind: .success,
+                        title: "提案已生成",
+                        detail: "\(proposal.summary)；\(diff.stats.summaryText)"
+                    )
                 }
             } catch {
                 await MainActor.run {
-                    draft = sourceDraft
                     isApplyingAI = false
                     statusMessage = nil
-                    errorMessage = "模型修改失败：\(error.localizedDescription)"
+                    errorMessage = "Markdown agent 生成失败：\(error.localizedDescription)"
+                    appendActivityLog(
+                        kind: .failure,
+                        title: "提案失败",
+                        detail: error.localizedDescription
+                    )
                 }
             }
         }
     }
 
-    private func markdownEditTurns(fileName: String, content: String, instruction: String) -> [OpenAIChatTurn] {
-        [
-            OpenAIChatTurn(
-                role: .system,
-                text: """
-                你是一名 Markdown 文档编辑助手。
-                你会收到一份 Markdown 文档全文和一条编辑指令。
-                你必须直接返回修改后的完整 Markdown 文档，不要解释，不要使用代码块围栏，不要添加额外前言。
-                如果用户只要求局部修改，也要返回更新后的完整文档。
-                """,
-                imageDataURLs: []
-            ),
-            OpenAIChatTurn(
-                role: .user,
-                text: """
-                文件名：\(fileName)
-
-                编辑要求：
-                \(instruction)
-
-                当前 Markdown 全文如下：
-                \(content)
-                """,
-                imageDataURLs: []
+    private func resolvedEditScope(for content: String) throws -> MarkdownAgentEditScope {
+        switch agentScopeMode {
+        case .fullDocument:
+            return .fullDocument(totalLines: MarkdownLineLocator.lineCount(in: content))
+        case .selection:
+            guard selectionSnapshot.hasSelection,
+                  let lineRange = selectionSnapshot.lineRange else {
+                throw MarkdownAgentError.missingSelection
+            }
+            return .selection(
+                selectedText: selectionSnapshot.selectedText,
+                lineRange: lineRange
             )
-        ]
+        case .lineRange:
+            let lineRange = try MarkdownLineLocator.parseLineRange(
+                from: lineRangeInput,
+                maxLine: MarkdownLineLocator.lineCount(in: content)
+            )
+            return .lineRange(
+                lineRange,
+                excerpt: MarkdownLineLocator.excerpt(for: lineRange, in: content),
+                totalLines: MarkdownLineLocator.lineCount(in: content)
+            )
+        }
+    }
+
+    private func confirmPendingProposal() {
+        guard let pendingProposal else { return }
+
+        do {
+            redoSnapshots.removeAll()
+            try MarkdownRevisionStore.push(
+                snapshot: MarkdownAgentRevisionSnapshot(
+                    fileName: attachment.fileName,
+                    instruction: pendingProposal.instruction,
+                    summary: pendingProposal.proposal.summary,
+                    content: pendingProposal.originalMarkdown
+                ),
+                for: attachment
+            )
+            try ChatDocumentStore.updateMarkdownFile(
+                for: attachment,
+                content: pendingProposal.proposal.updatedMarkdown
+            )
+
+            applyProgrammaticDraftState(pendingProposal.proposal.updatedMarkdown)
+            statusMessage = "提案已写回，可通过回滚按钮恢复"
+            appendActivityLog(
+                kind: .success,
+                title: "提案已写回",
+                detail: "\(pendingProposal.proposal.summary)；可随时回滚到上一个版本。"
+            )
+            AppLog.markdownAgent(
+                "proposal_applied file=\(attachment.fileName) summary=\(pendingProposal.proposal.summary)"
+            )
+            self.pendingProposal = nil
+            updateRevisionAvailability()
+        } catch {
+            errorMessage = error.localizedDescription
+            appendActivityLog(
+                kind: .failure,
+                title: "写回失败",
+                detail: error.localizedDescription
+            )
+        }
+    }
+
+    private func discardPendingProposal() {
+        guard let pendingProposal else { return }
+        appendActivityLog(
+            kind: .warning,
+            title: "提案已放弃",
+            detail: "已放弃这次 AI 修改提案：\(pendingProposal.proposal.summary)"
+        )
+        self.pendingProposal = nil
+        statusMessage = "已放弃这次提案"
+    }
+
+    private func rollbackLastRevision() {
+        do {
+            guard let snapshot = try MarkdownRevisionStore.popLatest(for: attachment) else {
+                statusMessage = "当前没有可回滚的版本"
+                return
+            }
+
+            redoSnapshots.append(
+                MarkdownAgentRevisionSnapshot(
+                    fileName: attachment.fileName,
+                    instruction: "rollback",
+                    summary: "回滚前版本",
+                    content: draft
+                )
+            )
+
+            try ChatDocumentStore.updateMarkdownFile(
+                for: attachment,
+                content: snapshot.content
+            )
+
+            applyProgrammaticDraftState(snapshot.content)
+            statusMessage = "已回滚到上一版"
+            appendActivityLog(
+                kind: .success,
+                title: "已回滚",
+                detail: "已恢复到 \(snapshot.createdAt.formatted(date: .omitted, time: .standard)) 的版本。"
+            )
+            AppLog.markdownAgent(
+                "rollback_applied file=\(attachment.fileName) snapshot=\(snapshot.id.uuidString)"
+            )
+            updateRevisionAvailability()
+        } catch {
+            errorMessage = error.localizedDescription
+            appendActivityLog(
+                kind: .failure,
+                title: "回滚失败",
+                detail: error.localizedDescription
+            )
+        }
+    }
+
+    private func redoLastRevision() {
+        do {
+            guard let snapshot = redoSnapshots.popLast() else {
+                statusMessage = "当前没有可重做的版本"
+                return
+            }
+
+            try MarkdownRevisionStore.push(
+                snapshot: MarkdownAgentRevisionSnapshot(
+                    fileName: attachment.fileName,
+                    instruction: "redo",
+                    summary: "重做前版本",
+                    content: draft
+                ),
+                for: attachment
+            )
+
+            try ChatDocumentStore.updateMarkdownFile(
+                for: attachment,
+                content: snapshot.content
+            )
+
+            applyProgrammaticDraftState(snapshot.content)
+            statusMessage = "已恢复到回滚前版本"
+            appendActivityLog(
+                kind: .success,
+                title: "已重做",
+                detail: "已恢复到刚才撤销前的版本。"
+            )
+            AppLog.markdownAgent(
+                "redo_applied file=\(attachment.fileName) snapshot=\(snapshot.id.uuidString)"
+            )
+            updateRevisionAvailability()
+        } catch {
+            errorMessage = error.localizedDescription
+            appendActivityLog(
+                kind: .failure,
+                title: "重做失败",
+                detail: error.localizedDescription
+            )
+        }
+    }
+
+    private func updateRevisionAvailability() {
+        canRollbackRevision = MarkdownRevisionStore.hasSnapshots(for: attachment)
+    }
+
+    private func applyProgrammaticDraftState(_ content: String) {
+        suppressRedoInvalidation = true
+        draft = content
+        savedDraft = content
+        selectionSnapshot = .empty
+
+        Task { @MainActor in
+            await Task.yield()
+            suppressRedoInvalidation = false
+        }
+    }
+
+    private func appendActivityLog(
+        kind: MarkdownAgentActivityEntry.Kind,
+        title: String,
+        detail: String
+    ) {
+        let entry = MarkdownAgentActivityEntry(
+            timestamp: Date(),
+            kind: kind,
+            title: title,
+            detail: detail
+        )
+        activityEntries.append(entry)
+        if activityEntries.count > 40 {
+            activityEntries.removeFirst(activityEntries.count - 40)
+        }
+        AppLog.markdownAgent("\(title) detail=\(detail)")
+    }
+
+    private func beginMarkdownVoiceCapture() {
+        guard isEditing, isApplyingAI == false else { return }
+        isVoiceCancellationPending = false
+        statusMessage = "请说出要如何修改这份 Markdown"
+        voiceInputController.beginCapture()
+        appendActivityLog(
+            kind: .info,
+            title: "语音输入开始",
+            detail: "开始录制语音指令。"
+        )
+    }
+
+    private func handleMarkdownVoiceCancellationPendingChange(_ isPending: Bool) {
+        guard isEditing else { return }
+        isVoiceCancellationPending = isPending
+    }
+
+    private func endMarkdownVoiceCapture(_ cancelled: Bool) {
+        guard isEditing else { return }
+
+        isVoiceCancellationPending = false
+        if cancelled {
+            voiceInputController.cancelCapture()
+            statusMessage = "已取消这次语音输入"
+            appendActivityLog(
+                kind: .warning,
+                title: "语音输入取消",
+                detail: "用户取消了语音输入。"
+            )
+        } else {
+            voiceInputController.endCapture()
+            statusMessage = "正在整理语音内容…"
+        }
+    }
+
+    private func cancelMarkdownVoiceCapture() {
+        voiceInputController.cancelCapture()
+        isVoiceCancellationPending = false
+    }
+
+    private func applyVoiceTranscript(_ transcript: String) {
+        let trimmedTranscript = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedTranscript.isEmpty == false else { return }
+
+        let updatedInstruction: String
+        if aiInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            updatedInstruction = trimmedTranscript
+        } else {
+            updatedInstruction = aiInstruction + "\n" + trimmedTranscript
+        }
+        aiInstruction = updatedInstruction
+
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+            isAIDockExpanded = true
+        }
+        appendActivityLog(
+            kind: .success,
+            title: "语音已转写",
+            detail: "已将语音内容写入 AI 指令输入框。"
+        )
+
+        if voiceSendMode == .auto, canApplyAI(for: updatedInstruction) {
+            statusMessage = "语音内容已写入，正在生成提案…"
+            DispatchQueue.main.async {
+                applyAIEdit()
+            }
+        } else if voiceSendMode == .auto {
+            statusMessage = "语音内容已写入，请先确认范围后再生成提案"
+        } else {
+            statusMessage = "语音内容已写入，请确认后生成提案"
+        }
+    }
+
+    private func resolvedFloatingBubbleCenter(in size: CGSize) -> CGPoint {
+        let persistedCenter = persistedFloatingBubbleCenter(in: size)
+        return clampedFloatingBubbleCenter(
+            CGPoint(
+                x: persistedCenter.x + floatingBubbleDragOffset.width,
+                y: persistedCenter.y + floatingBubbleDragOffset.height
+            ),
+            in: size
+        )
+    }
+
+    private func persistedFloatingBubbleCenter(in size: CGSize) -> CGPoint {
+        let bounds = floatingBubbleBounds(in: size)
+        let x = bounds.minX + CGFloat(floatingBubbleNormalizedX) * bounds.width
+        let y = bounds.minY + CGFloat(floatingBubbleNormalizedY) * bounds.height
+        return clampedFloatingBubbleCenter(CGPoint(x: x, y: y), in: size)
+    }
+
+    private func persistFloatingBubbleCenter(_ center: CGPoint, in size: CGSize) {
+        let bounds = floatingBubbleBounds(in: size)
+        let clampedCenter = clampedFloatingBubbleCenter(center, in: size)
+
+        if bounds.width > 0 {
+            floatingBubbleNormalizedX = min(max(Double((clampedCenter.x - bounds.minX) / bounds.width), 0), 1)
+        }
+
+        if bounds.height > 0 {
+            floatingBubbleNormalizedY = min(max(Double((clampedCenter.y - bounds.minY) / bounds.height), 0), 1)
+        }
+    }
+
+    private func clampedFloatingBubbleCenter(_ center: CGPoint, in size: CGSize) -> CGPoint {
+        let bounds = floatingBubbleBounds(in: size)
+        return CGPoint(
+            x: min(max(center.x, bounds.minX), bounds.maxX),
+            y: min(max(center.y, bounds.minY), bounds.maxY)
+        )
+    }
+
+    private func floatingBubbleBounds(in size: CGSize) -> CGRect {
+        let diameter: CGFloat = 58
+        let horizontalPadding: CGFloat = 20
+        let topPadding: CGFloat = 112
+        let bottomPadding: CGFloat = 116
+
+        let minX = horizontalPadding + diameter / 2
+        let maxX = max(minX, size.width - horizontalPadding - diameter / 2)
+        let minY = topPadding + diameter / 2
+        let maxY = max(minY, size.height - bottomPadding - diameter / 2)
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(maxX - minX, 0),
+            height: max(maxY - minY, 0)
+        )
     }
 }
 
 private struct MarkdownEditorAIDockView: View {
     @Binding var instruction: String
+    @Binding var isExpanded: Bool
+    @Binding var scopeMode: MarkdownAgentScopeMode
+    @Binding var lineRangeInput: String
+    let selectionSnapshot: MarkdownEditorSelectionSnapshot
+    let totalLineCount: Int
     let canApplyAI: Bool
     let isApplyingAI: Bool
     let statusMessage: String?
+    let isVoiceCapturing: Bool
+    let isVoiceCaptureEnabled: Bool
+    let onVoicePressBegan: () -> Void
+    let onVoiceCancelPreviewChanged: (Bool) -> Void
+    let onVoicePressEnded: (Bool) -> Void
     let onApply: () -> Void
 
     var body: some View {
+        expandedContainer
+            .padding(.horizontal, 10)
+            .padding(.top, 8)
+    }
+
+    private var expandedContainer: some View {
         VStack(alignment: .leading, spacing: 10) {
+            expandedContent
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 16)
+        .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(Color.white)
+                .shadow(color: Color.black.opacity(0.06), radius: 16, x: 0, y: -2)
+        )
+    }
+
+    private var expandedContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Label("AI 修改", systemImage: "sparkles")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.black.opacity(0.58))
+
+                Spacer(minLength: 8)
+
+                dockToggleButton(
+                    title: "收起",
+                    systemImage: "chevron.down"
+                ) {
+                    withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                        isExpanded = false
+                    }
+                }
+                .accessibilityIdentifier("markdown_document_ai_dock_collapse_button")
+            }
+
             if let statusMessage {
                 Text(statusMessage)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Color.black.opacity(0.46))
             }
+
+            MarkdownAgentScopePickerView(scopeMode: $scopeMode)
+
+            scopeHint
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color(red: 0.972, green: 0.976, blue: 0.982))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(Color.black.opacity(0.06), lineWidth: 1)
+                )
 
             HStack(spacing: 12) {
                 TextField("告诉模型如何修改这份 Markdown…", text: $instruction, axis: .vertical)
@@ -614,7 +1232,7 @@ private struct MarkdownEditorAIDockView: View {
                     .foregroundStyle(Color.black.opacity(0.84))
                     .tint(Color.black.opacity(0.84))
                     .lineLimit(1...3)
-                    .submitLabel(.send)
+                    .submitLabel(.return)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 12)
                     .background(
@@ -626,6 +1244,15 @@ private struct MarkdownEditorAIDockView: View {
                             .stroke(Color.black.opacity(0.06), lineWidth: 1)
                     )
                     .accessibilityIdentifier("markdown_document_ai_instruction_input")
+
+                MarkdownVoiceCaptureButton(
+                    isCapturing: isVoiceCapturing,
+                    isCaptureEnabled: isVoiceCaptureEnabled,
+                    onPressBegan: onVoicePressBegan,
+                    onCancelPreviewChanged: onVoiceCancelPreviewChanged,
+                    onPressEnded: onVoicePressEnded
+                )
+                .accessibilityIdentifier("markdown_document_ai_voice_button")
 
                 Button(action: onApply) {
                     if isApplyingAI {
@@ -650,21 +1277,220 @@ private struct MarkdownEditorAIDockView: View {
                 .accessibilityIdentifier("markdown_document_ai_apply_button")
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.top, 12)
-        .padding(.bottom, 16)
-        .background(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .fill(Color.white)
-                .shadow(color: Color.black.opacity(0.06), radius: 16, x: 0, y: -2)
+    }
+
+    @ViewBuilder
+    private var scopeHint: some View {
+        switch scopeMode {
+        case .fullDocument:
+            VStack(alignment: .leading, spacing: 4) {
+                Text("全文模式")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.black.opacity(0.66))
+                Text("模型会参考整份 Markdown，当前共 \(totalLineCount) 行。")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color.black.opacity(0.44))
+            }
+        case .selection:
+            VStack(alignment: .leading, spacing: 4) {
+                Text("选区模式")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.black.opacity(0.66))
+                Text(selectionSnapshot.hasSelection ? "当前范围：\(selectionSnapshot.lineLabel)" : "请先在编辑器里选中文本，再发起 AI 修改。")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(selectionSnapshot.hasSelection ? Color.black.opacity(0.44) : Color(red: 0.76, green: 0.35, blue: 0.20))
+                    .lineLimit(2)
+            }
+        case .lineRange:
+            VStack(alignment: .leading, spacing: 8) {
+                Text("行号模式")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.black.opacity(0.66))
+
+                TextField("输入行号，如 12-18", text: $lineRangeInput)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 14, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Color.black.opacity(0.82))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(Color.white)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .stroke(Color.black.opacity(0.05), lineWidth: 1)
+                    )
+                    .accessibilityIdentifier("markdown_document_ai_line_range_input")
+
+                Text("当前文档共 \(totalLineCount) 行。")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(Color.black.opacity(0.44))
+            }
+        }
+    }
+
+    private func dockToggleButton(
+        title: String,
+        systemImage: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+
+                Image(systemName: systemImage)
+                    .font(.system(size: 11, weight: .bold))
+            }
+            .foregroundStyle(Color.black.opacity(0.46))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(
+                Capsule()
+                    .fill(Color.black.opacity(0.05))
+            )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct MarkdownFloatingAssistantBubble: View {
+    let showsIndicator: Bool
+    let accessibilityValue: String
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            Circle()
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.09, green: 0.48, blue: 1.0),
+                            Color(red: 0.14, green: 0.66, blue: 0.96)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .shadow(color: Color.black.opacity(0.12), radius: 18, x: 0, y: 8)
+
+            Image(systemName: "sparkles")
+                .font(.system(size: 21, weight: .bold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+
+            if showsIndicator {
+                Circle()
+                    .fill(Color.white)
+                    .frame(width: 16, height: 16)
+                    .overlay(
+                        Circle()
+                            .fill(Color(red: 1.0, green: 0.73, blue: 0.18))
+                            .frame(width: 8, height: 8)
+                    )
+                    .offset(x: 4, y: -2)
+            }
+        }
+        .frame(width: 58, height: 58)
+        .contentShape(Circle())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("展开 AI 修改文档")
+        .accessibilityValue(accessibilityValue)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityIdentifier("markdown_document_ai_dock_expand_button")
+    }
+}
+
+private struct MarkdownVoiceCaptureButton: View {
+    let isCapturing: Bool
+    let isCaptureEnabled: Bool
+    var diameter: CGFloat = 34
+    var iconSize: CGFloat = 15
+    var shadowRadius: CGFloat = 10
+    var shadowYOffset: CGFloat = 5
+    let onPressBegan: () -> Void
+    let onCancelPreviewChanged: (Bool) -> Void
+    let onPressEnded: (Bool) -> Void
+
+    @State private var isPressing = false
+    @State private var isCancellationPending = false
+
+    private let cancelThreshold: CGFloat = -72
+
+    var body: some View {
+        Circle()
+            .fill(backgroundFill)
+            .overlay(
+                Image(systemName: iconName)
+                    .font(.system(size: iconSize, weight: .bold))
+                    .foregroundStyle(.white)
+            )
+            .frame(width: diameter, height: diameter)
+            .shadow(color: Color.black.opacity(0.12), radius: shadowRadius, x: 0, y: shadowYOffset)
+            .opacity(isCaptureEnabled ? 1 : 0.45)
+            .contentShape(Circle())
+            .gesture(dragGesture)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("按住语音输入")
+            .accessibilityValue(isCapturing ? "正在录音" : "松开后会写入 AI 指令")
+            .accessibilityAddTraits(.isButton)
+    }
+
+    private var backgroundFill: some ShapeStyle {
+        LinearGradient(
+            colors: isCapturing
+                ? [
+                    Color(red: 0.96, green: 0.31, blue: 0.35),
+                    Color(red: 1.0, green: 0.47, blue: 0.38)
+                ]
+                : [
+                    Color(red: 0.09, green: 0.48, blue: 1.0),
+                    Color(red: 0.14, green: 0.66, blue: 0.96)
+                ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
         )
-        .padding(.horizontal, 10)
-        .padding(.top, 8)
+    }
+
+    private var iconName: String {
+        if isCancellationPending {
+            return "xmark"
+        }
+
+        return isCapturing ? "waveform" : "mic.fill"
+    }
+
+    private var dragGesture: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                guard isCaptureEnabled else { return }
+
+                if isPressing == false {
+                    isPressing = true
+                    onPressBegan()
+                }
+
+                let nextPending = value.translation.height <= cancelThreshold
+                guard nextPending != isCancellationPending else { return }
+                isCancellationPending = nextPending
+                onCancelPreviewChanged(nextPending)
+            }
+            .onEnded { _ in
+                let shouldCancel = isCancellationPending
+                isPressing = false
+                isCancellationPending = false
+                onCancelPreviewChanged(false)
+                if isCaptureEnabled {
+                    onPressEnded(shouldCancel)
+                }
+            }
     }
 }
 
 private struct MarkdownSyntaxTextEditor: UIViewRepresentable {
     @Binding var text: String
+    @Binding var selectionSnapshot: MarkdownEditorSelectionSnapshot
+    var extraBottomInset: CGFloat = 0
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -687,15 +1513,21 @@ private struct MarkdownSyntaxTextEditor: UIViewRepresentable {
         textView.smartQuotesType = .no
         textView.smartInsertDeleteType = .no
         textView.spellCheckingType = .no
-        textView.textContainerInset = UIEdgeInsets(top: 18, left: 18, bottom: 28, right: 18)
+        textView.textContainerInset = textContainerInset
         textView.textContainer.lineFragmentPadding = 0
         context.coordinator.applyHighlighting(to: textView, text: text, preserveSelection: false)
+        context.coordinator.updateSelectionSnapshot(from: textView)
         return textView
     }
 
     func updateUIView(_ uiView: UITextView, context: Context) {
         context.coordinator.parent = self
+        uiView.textContainerInset = textContainerInset
         context.coordinator.syncTextView(uiView)
+    }
+
+    private var textContainerInset: UIEdgeInsets {
+        UIEdgeInsets(top: 18, left: 18, bottom: 28 + extraBottomInset, right: 18)
     }
 
     final class Coordinator: NSObject, UITextViewDelegate {
@@ -723,6 +1555,8 @@ private struct MarkdownSyntaxTextEditor: UIViewRepresentable {
         }
 
         func textViewDidChange(_ textView: UITextView) {
+            guard isApplyingProgrammaticUpdate == false else { return }
+
             if parent.text != textView.text {
                 parent.text = textView.text
             }
@@ -733,9 +1567,12 @@ private struct MarkdownSyntaxTextEditor: UIViewRepresentable {
             }
 
             applyHighlighting(to: textView, text: textView.text, preserveSelection: true)
+            updateSelectionSnapshot(from: textView)
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
+            guard isApplyingProgrammaticUpdate == false else { return }
+            updateSelectionSnapshot(from: textView)
             guard needsHighlightRefreshAfterMarkedText, textView.markedTextRange == nil else { return }
             applyHighlighting(to: textView, text: textView.text, preserveSelection: true)
             needsHighlightRefreshAfterMarkedText = false
@@ -756,6 +1593,21 @@ private struct MarkdownSyntaxTextEditor: UIViewRepresentable {
                 length: min(selectedRange.length, maxLength)
             )
             isApplyingProgrammaticUpdate = false
+            updateSelectionSnapshot(from: textView)
+        }
+
+        func updateSelectionSnapshot(from textView: UITextView) {
+            let snapshot = MarkdownLineLocator.makeSelectionSnapshot(
+                text: textView.text ?? "",
+                selectedRange: textView.selectedRange
+            )
+            guard parent.selectionSnapshot != snapshot else { return }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard self.parent.selectionSnapshot != snapshot else { return }
+                self.parent.selectionSnapshot = snapshot
+            }
         }
     }
 }
@@ -967,17 +1819,6 @@ private enum MarkdownSyntaxHighlighter {
         style.lineSpacing = 6
         style.paragraphSpacing = 2
         return style
-    }
-}
-
-private enum MarkdownEditorAIError: LocalizedError {
-    case emptyResponse
-
-    var errorDescription: String? {
-        switch self {
-        case .emptyResponse:
-            return "模型返回了空文档，已取消本次修改。"
-        }
     }
 }
 

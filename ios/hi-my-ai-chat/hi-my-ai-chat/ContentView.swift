@@ -303,6 +303,26 @@ struct ContentView: View {
         favoriteEntries.isEmpty ? "还没有收藏的回复" : "已收藏 \(favoriteEntries.count) 条回复"
     }
 
+    private var storedDocumentEntries: [StoredChatDocumentEntry] {
+        let attachments = sessionStore.sessions
+            .flatMap(\.messages)
+            .flatMap(\.documentAttachments)
+            + messages.flatMap(\.documentAttachments)
+            + pendingDocumentAttachments
+
+        let metadataByPath = attachments.reduce(into: [String: ChatDocumentAttachment]()) { partialResult, attachment in
+            if partialResult[attachment.storageRelativePath] == nil {
+                partialResult[attachment.storageRelativePath] = attachment
+            }
+        }
+
+        return (try? ChatDocumentStore.listStoredDocuments(preferredMetadataByPath: metadataByPath)) ?? []
+    }
+
+    private var filesSubtitleText: String {
+        storedDocumentEntries.isEmpty ? "本地还没有文件" : "本地文件 \(storedDocumentEntries.count) 个"
+    }
+
     private var composerLoadingText: String {
         currentRetryAttempt > 0 ? "重试中" : "生成中"
     }
@@ -413,6 +433,8 @@ struct ContentView: View {
             chatDetailView
         case .favorites:
             favoritesDetailView
+        case .files:
+            filesDetailView
         }
     }
 
@@ -652,6 +674,48 @@ struct ContentView: View {
                     entries: favoriteEntries,
                     onOpenEntry: openFavoritedMessage,
                     onRemoveFavorite: removeFavorite
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.horizontal, 12)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let toastMessage {
+                        InlineToastView(message: toastMessage)
+                            .padding(.horizontal, 18)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                }
+                .padding(.bottom, 16)
+                .animation(.easeInOut(duration: 0.18), value: toastMessage)
+            }
+        }
+        .background(Color(red: 0.985, green: 0.985, blue: 0.982))
+    }
+
+    private var filesDetailView: some View {
+        ZStack(alignment: .bottom) {
+            HomeBackgroundView()
+
+            VStack(spacing: 0) {
+                TopBarView(
+                    title: SidebarItem.files.title,
+                    subtitle: filesSubtitleText,
+                    onMenuTap: toggleSidebar,
+                    onTitleTap: {},
+                    isTitleEnabled: false,
+                    isAudioAvailable: false,
+                    isAudioPlaying: false,
+                    onAudioTap: {}
+                )
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+                .padding(.bottom, 8)
+
+                FilesView(
+                    entries: storedDocumentEntries,
+                    onOpenDocument: openPreview
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.horizontal, 12)

@@ -97,10 +97,20 @@ struct ChatDocumentAttachment: Identifiable, Equatable, Codable, Sendable {
     }
 }
 
+struct StoredChatDocumentEntry: Identifiable, Equatable, Sendable {
+    let attachment: ChatDocumentAttachment
+    let modifiedAt: Date
+
+    var id: UUID {
+        attachment.id
+    }
+}
+
 enum ChatDocumentStoreError: LocalizedError {
     case unsupportedFile
     case failedToRead
     case failedToWrite
+    case failedToEnumerate
 
     var errorDescription: String? {
         switch self {
@@ -110,6 +120,8 @@ enum ChatDocumentStoreError: LocalizedError {
             return "读取文件失败，请重试。"
         case .failedToWrite:
             return "写入文件失败，请重试。"
+        case .failedToEnumerate:
+            return "读取本地文件列表失败，请重试。"
         }
     }
 }
@@ -162,6 +174,67 @@ enum ChatDocumentStore {
             try content.write(to: attachment.resolvedURL, atomically: true, encoding: .utf8)
         } catch {
             throw ChatDocumentStoreError.failedToWrite
+        }
+    }
+
+    static func listStoredDocuments(
+        preferredMetadataByPath: [String: ChatDocumentAttachment] = [:]
+    ) throws -> [StoredChatDocumentEntry] {
+        do {
+            try ensureBaseDirectory()
+            let fileURLs = try FileManager.default.contentsOfDirectory(
+                at: baseDirectory,
+                includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+                options: [.skipsHiddenFiles]
+            )
+
+            let entries = try fileURLs.compactMap { url -> StoredChatDocumentEntry? in
+                let fileExtension = url.pathExtension.lowercased()
+                let kind = documentKind(for: fileExtension)
+                guard kind != .other else { return nil }
+
+                let storageRelativePath = url.lastPathComponent
+                let resourceValues = try url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+                let fileSize = resourceValues.fileSize.map(Int64.init) ?? 0
+                let modifiedAt = resourceValues.contentModificationDate ?? .distantPast
+
+                let attachment: ChatDocumentAttachment
+                if let preferredAttachment = preferredMetadataByPath[storageRelativePath] {
+                    attachment = ChatDocumentAttachment(
+                        id: preferredAttachment.id,
+                        fileName: preferredAttachment.fileName,
+                        mimeType: preferredAttachment.mimeType,
+                        kind: preferredAttachment.kind,
+                        storageRelativePath: preferredAttachment.storageRelativePath,
+                        pageCount: preferredAttachment.pageCount ?? pdfPageCountIfNeeded(for: kind, url: url),
+                        fileSizeBytes: fileSize
+                    )
+                } else {
+                    attachment = ChatDocumentAttachment(
+                        fileName: url.lastPathComponent,
+                        mimeType: mimeType(for: fileExtension),
+                        kind: kind,
+                        storageRelativePath: storageRelativePath,
+                        pageCount: pdfPageCountIfNeeded(for: kind, url: url),
+                        fileSizeBytes: fileSize
+                    )
+                }
+
+                return StoredChatDocumentEntry(
+                    attachment: attachment,
+                    modifiedAt: modifiedAt
+                )
+            }
+
+            return entries.sorted { lhs, rhs in
+                if lhs.modifiedAt == rhs.modifiedAt {
+                    return lhs.attachment.fileName.localizedStandardCompare(rhs.attachment.fileName) == .orderedAscending
+                }
+
+                return lhs.modifiedAt > rhs.modifiedAt
+            }
+        } catch {
+            throw ChatDocumentStoreError.failedToEnumerate
         }
     }
 
@@ -236,6 +309,11 @@ enum ChatDocumentStore {
         default:
             return "application/octet-stream"
         }
+    }
+
+    private static func pdfPageCountIfNeeded(for kind: ChatDocumentAttachment.Kind, url: URL) -> Int? {
+        guard kind == .pdf else { return nil }
+        return PDFDocument(url: url)?.pageCount
     }
 
     private static func ensureBaseDirectory() throws {

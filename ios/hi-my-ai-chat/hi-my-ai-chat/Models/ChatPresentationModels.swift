@@ -4,6 +4,7 @@ import UIKit
 enum SidebarItem: String, CaseIterable, Identifiable {
     case chat
     case favorites
+    case files
 
     var id: String { rawValue }
 
@@ -13,6 +14,8 @@ enum SidebarItem: String, CaseIterable, Identifiable {
             return "聊天"
         case .favorites:
             return "收藏"
+        case .files:
+            return "文件"
         }
     }
 
@@ -22,6 +25,8 @@ enum SidebarItem: String, CaseIterable, Identifiable {
             return "message"
         case .favorites:
             return "bookmark"
+        case .files:
+            return "folder"
         }
     }
 }
